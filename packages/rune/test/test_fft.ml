@@ -48,7 +48,9 @@ let h5 () =
 (* Gradients against finite differences *)
 
 let test_grad_roundtrip_even () =
-  check_grad ~msg:"irfft(rfft x), n=8" (fun x -> Nx.irfft f64 (Nx.rfft c128 x)) (x8 ())
+  check_grad ~msg:"irfft(rfft x), n=8"
+    (fun x -> Nx.irfft f64 (Nx.rfft c128 x))
+    (x8 ())
 
 let test_grad_roundtrip_odd () =
   check_grad ~msg:"irfft(rfft x), n=7"
@@ -165,7 +167,9 @@ let test_irfft_pull_odd () =
 (* Forward mode *)
 
 let test_jvp_roundtrip_even () =
-  check_jvp ~msg:"irfft(rfft x), n=8" (fun x -> Nx.irfft f64 (Nx.rfft c128 x)) (x8 ())
+  check_jvp ~msg:"irfft(rfft x), n=8"
+    (fun x -> Nx.irfft f64 (Nx.rfft c128 x))
+    (x8 ())
 
 let test_jvp_roundtrip_odd () =
   check_jvp ~msg:"irfft(rfft x), n=7"
@@ -182,7 +186,9 @@ let test_jvp_irfft_is_linear () =
   let y = ct4 () in
   let v = cvec [| (0.6, 0.2); (-0.8, 1.3); (0.4, -0.5) |] in
   let _, dy = Rune.jvp' (fun y -> Nx.irfft f64 ~n:5 y) y v in
-  check_arr ~eps:1e-10 ~msg:"jvp irfft = irfft v" (to_arr (Nx.irfft f64 ~n:5 v)) dy
+  check_arr ~eps:1e-10 ~msg:"jvp irfft = irfft v"
+    (to_arr (Nx.irfft f64 ~n:5 v))
+    dy
 
 let test_jvp_vjp_consistency () =
   (* <w, jvp_v f x> = <vjp_w f x, v> for the filtered spectral pipeline. *)
@@ -222,7 +228,8 @@ let xs () =
 
 let test_vmap_fft () = check_vmap_c ~msg:"fft" (fun z -> Nx.fft z) (zs ())
 let test_vmap_ifft () = check_vmap_c ~msg:"ifft" (fun z -> Nx.ifft z) (zs ())
-let test_vmap_rfft () = check_vmap_c ~msg:"rfft" (fun x -> Nx.rfft c128 x) (xs ())
+let test_vmap_rfft () =
+  check_vmap_c ~msg:"rfft" (fun x -> Nx.rfft c128 x) (xs ())
 
 let test_vmap_irfft () =
   check_vmap_r ~msg:"irfft" (fun z -> Nx.irfft f64 ~n:6 z) (zs ())

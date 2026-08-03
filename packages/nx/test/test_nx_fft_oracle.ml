@@ -203,7 +203,9 @@ let test_rfft_dc_nyquist_exact () =
   List.iter
     (fun n ->
       let spec =
-        Nx.to_array (Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] (rsig (5000 + n) n)))
+        Nx.to_array
+          (Nx.rfft Nx.complex128
+             (Nx.create Nx.float64 [| n |] (rsig (5000 + n) n)))
       in
       is_true
         ~msg:(Printf.sprintf "Im X[0] = 0 exactly, n=%d" n)
@@ -279,20 +281,22 @@ let test_irfft_exhaustive () =
 let test_roundtrip_exhaustive () =
   for n = 1 to 256 do
     let x = rsig (9000 + n) n in
+    let spec = Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] x) in
     rel_l2_f
       (Printf.sprintf "irfft(rfft x) n=%d" n)
       1e-14 x
-      (Nx.to_array (Nx.irfft Nx.float64 ~n (Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] x))))
+      (Nx.to_array (Nx.irfft Nx.float64 ~n spec))
   done
 
 let test_roundtrip_large () =
   List.iter
     (fun n ->
       let x = rsig (10000 + (n mod 977)) n in
+      let spec = Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] x) in
       rel_l2_f
         (Printf.sprintf "irfft(rfft x) n=%d" n)
         1e-14 x
-        (Nx.to_array (Nx.irfft Nx.float64 ~n (Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] x)))))
+        (Nx.to_array (Nx.irfft Nx.float64 ~n spec)))
     [ 4096; 65536; 44100; 131042; 65535 ]
 
 (* ── Pad / truncate sweep ──
@@ -422,7 +426,8 @@ let test_irfft_strided_view_c128 () =
 let test_irfft_strided_view_c64 () =
   let n = 34 in
   let spec =
-    Nx.cast Nx.complex64 (Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] (rsig 7 n)))
+    Nx.cast Nx.complex64
+      (Nx.rfft Nx.complex128 (Nx.create Nx.float64 [| n |] (rsig 7 n)))
   in
   let half = (n / 2) + 1 in
   let doubled =
