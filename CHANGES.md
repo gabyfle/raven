@@ -381,6 +381,12 @@ thread.
 - Add float32- and float64-preserving `dct`, `idct`, `dst`, and `idst`
   transforms of types I–IV, including N-D variants and forward, backward, and
   orthonormal scaling modes.
+- Speed up the default C backend's FFTs: even-length `rfft` and `irfft` now
+  pack into a half-size complex transform instead of running a full-length
+  one, a single-axis `irfft` reads its input directly instead of staging a
+  serial complex copy, and Bluestein (large-prime) lengths pad to the nearest
+  7-smooth size instead of the next power of two. Even-length `rfft` also
+  returns exactly real DC and Nyquist bins now.
 - `Nx.concatenate` on the OxCaml backend now uses SIMD and unrolled contiguous
   block copies, with stride-aware paths for offset, transposed, flipped, and
   broadcast views.

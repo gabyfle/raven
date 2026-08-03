@@ -132,8 +132,8 @@ let test_rfft_over_view () =
   in
   let x = Nx.create Nx.float64 [| n |] signal in
   let frames = Nx.sliding_window_view ~window:32 ~step:8 x in
-  let spectrum_view = Nx.rfft frames ~axis:(-1) in
-  let spectrum_copy = Nx.rfft (Nx.contiguous frames) ~axis:(-1) in
+  let spectrum_view = Nx.rfft Nx.complex128 frames ~axis:(-1) in
+  let spectrum_copy = Nx.rfft Nx.complex128 (Nx.contiguous frames) ~axis:(-1) in
   check_nx ~epsilon:1e-12 "rfft over view vs copy" spectrum_copy spectrum_view
 
 let test_errors () =
