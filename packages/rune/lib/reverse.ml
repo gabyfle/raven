@@ -20,10 +20,10 @@
    gradient fall into three deliberate categories: - zero derivative
    (comparisons, bitwise and integer ops, rounding, argmax/argmin/argsort, RNG,
    tensor creation): fall through untracked, which yields the correct zero
-   gradient; - no rule implemented (svd, eig, eigh, rfft, irfft, psum, mod):
-   raise when an input is tracked instead of silently producing a zero gradient
-   — detach the input if differentiation should not flow through it; - in-place
-   mutation (assign): always raises during differentiation. *)
+   gradient; - no rule implemented (svd, eig, eigh, psum, mod): raise when an
+   input is tracked instead of silently producing a zero gradient — detach the
+   input if differentiation should not flow through it; - in-place mutation
+   (assign): always raises during differentiation. *)
 
 open Nx_effect
 module T = Nx
@@ -654,20 +654,85 @@ let handler (tape : Tape.t) =
                         end)
               end;
               continue k out)
-      (* FFT: fft and ifft are duals; the real-valued variants have no rule
-         yet. *)
+      (* FFT: every transform is linear, so each pull is a transpose. fft and
+         ifft (unnormalized at this level) are each other's transpose; the
+         frontend's norm scaling is a separate mul that differentiates
+         itself. *)
       | E_fft { t; axes } ->
           Some (fun k -> pull1 k (fft t ~axes) t (fun g -> ifft g ~axes))
       | E_ifft { t; axes } ->
           Some (fun k -> pull1 k (ifft t ~axes) t (fun g -> fft g ~axes))
+      (* rfft keeps the half spectrum along the last transformed axis; leading
+         transformed axes are a plain c2c pass whose transpose is ifft. Along
+         the last axis irfft's Hermitian reconstruction counts each interior bin
+         twice (once directly, once as its conjugate mirror) while bin 0 and —
+         for even n — the self-mirroring Nyquist bin are counted once, so
+         halving the interior bins first makes the unnormalized irfft the exact
+         transpose. *)
       | E_rfft { t; dtype; axes } ->
           Some
             (fun k ->
-              no_rule k "rfft" (tracked t) (fun () -> rfft t ~dtype ~axes))
+              pull1 k (rfft t ~dtype ~axes) t (fun g ->
+                  let last = axes.(Array.length axes - 1) in
+                  let n = (T.shape t).(last) in
+                  let g =
+                    if Array.length axes > 1 then
+                      ifft g ~axes:(Array.sub axes 0 (Array.length axes - 1))
+                    else g
+                  in
+                  let m = (T.shape g).(last) in
+                  let mask =
+                    T.init dtype [| m |] (fun idx ->
+                        if idx.(0) = 0 || (n mod 2 = 0 && idx.(0) = m - 1) then
+                          Complex.one
+                        else { Complex.re = 0.5; im = 0.0 })
+                  in
+                  let bshape = Array.make (Array.length (T.shape g)) 1 in
+                  bshape.(last) <- m;
+                  let g = T.mul g (T.reshape bshape mask) in
+                  irfft g ~s:[| n |] ~dtype:(T.dtype t) ~axes:[| last |]))
+      (* irfft mirrors the interior of the half spectrum along the last
+         transformed axis, so those bins receive two contributions: rfft of the
+         cotangent with bins 1 .. n - m doubled (m = n/2 + 1; the count covers
+         even and odd n uniformly). The forward ignores bins beyond what n
+         supports and zero-fills a short spectrum, so the pull pads or shrinks
+         back to the input's bins. Leading transformed axes are a plain c2c
+         inverse whose transpose is fft. *)
       | E_irfft { t; dtype; axes; s } ->
           Some
             (fun k ->
-              no_rule k "irfft" (tracked t) (fun () -> irfft t ~axes ?s ~dtype))
+              pull1 k (irfft t ~axes ?s ~dtype) t (fun g ->
+                  let last = axes.(Array.length axes - 1) in
+                  let n = (T.shape g).(last) in
+                  let m_in = (T.shape t).(last) in
+                  let cdtype = T.dtype t in
+                  let gi = rfft g ~dtype:cdtype ~axes:[| last |] in
+                  let m = (T.shape gi).(last) in
+                  let dbl =
+                    T.init cdtype [| m |] (fun idx ->
+                        if idx.(0) >= 1 && idx.(0) <= n - m then
+                          { Complex.re = 2.0; im = 0.0 }
+                        else Complex.one)
+                  in
+                  let bshape = Array.make (Array.length (T.shape gi)) 1 in
+                  bshape.(last) <- m;
+                  let gi = T.mul gi (T.reshape bshape dbl) in
+                  let gi =
+                    if m_in > m then begin
+                      let cfg = Array.make (Array.length (T.shape gi)) (0, 0) in
+                      cfg.(last) <- (0, m_in - m);
+                      T.pad cfg Complex.zero gi
+                    end
+                    else if m_in < m then begin
+                      let lim = Array.map (fun d -> (0, d)) (T.shape gi) in
+                      lim.(last) <- (0, m_in);
+                      T.shrink lim gi
+                    end
+                    else gi
+                  in
+                  if Array.length axes > 1 then
+                    fft gi ~axes:(Array.sub axes 0 (Array.length axes - 1))
+                  else gi))
       | E_psum { t_in } ->
           Some
             (fun k -> no_rule k "psum" (tracked t_in) (fun () -> op_psum t_in))
