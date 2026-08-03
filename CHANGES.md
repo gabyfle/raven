@@ -363,6 +363,10 @@ thread.
 
 ### Nx
 
+- **Breaking:** `rfft`, `irfft`, `hfft`, `ihfft` and their 2-D/N-D variants now
+  take the output dtype first, like the constructors. Real FFTs preserve
+  precision: float32 input can produce a `complex64` spectrum instead of always
+  promoting to `complex128`.
 - **Breaking:** consolidate tensor formatting around the compact `Nx.pp`,
   `Nx.to_string`, and `Nx.print`. Remove `pp_data`, `data_to_string`,
   `print_data`, `format_to_string`, `print_with_formatter`, `dtype_to_string`,
