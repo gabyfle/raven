@@ -641,6 +641,10 @@ thread.
 
 ### Rune
 
+- `grad`, `vjp`, and `jvp` now differentiate `Nx.rfft` and `Nx.irfft` — both
+  are linear, so each rule is an exact transpose — and `vmap` batches all four
+  FFT transforms (`fft`, `ifft`, `rfft`, `irfft`), so spectral losses built on
+  real FFTs train end to end.
 - `jacfwd'` and `jacrev'` support float32 and float64 inputs without an
   implicit float64 specialization. Forward-mode Jacobians keep the output
   dtype, reverse-mode Jacobians keep the input dtype, and both evaluate the
