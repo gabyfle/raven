@@ -483,6 +483,12 @@ thread.
 
 ### Nx
 
+- Speed up the default C backend's FFTs: even-length `rfft` and `irfft` now
+  pack into a half-size complex transform instead of running a full-length
+  one, a single-axis `irfft` reads its input directly instead of staging a
+  serial complex copy, and Bluestein (large-prime) lengths pad to the nearest
+  7-smooth size instead of the next power of two. Even-length `rfft` also
+  returns exactly real DC and Nyquist bins now.
 - Add `sliding_window_view`, a zero-copy view framing a tensor into windows of a
   given length along an axis. Framing without a copy was reachable only through
   `stft`, which bundles a taper and a transform with it; a reduction, a filter
