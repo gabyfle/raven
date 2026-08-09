@@ -986,6 +986,31 @@ static void t_precondition_checks(void) {
   s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, al, E8, NX_C_COST_BANDWIDTH,
                   NULL);
   check(status_is(s, NX_C_ERR_OUT_ALIASED), "map rejects aliased output");
+
+  /* map: an overlapping window aliases with every stride non-zero — the case a
+     zero-stride test alone lets through */
+  int64_t wsh[2] = {3, 3}, wst[2] = {1, 1};
+  nx_c_ndarray ov[2] = {nd(out, 2, wsh, wst, 0), nd(buf, 2, wsh, wst, 0)};
+  s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, ov, E8, NX_C_COST_BANDWIDTH,
+                  NULL);
+  check(status_is(s, NX_C_ERR_OUT_ALIASED),
+        "map rejects an overlapping window output");
+
+  /* map: windows whose step clears their width are disjoint, and a gap between
+     them must not be read as overlap */
+  int64_t dsh[2] = {2, 2}, dst[2] = {3, 1};
+  nx_c_ndarray dj[2] = {nd(out, 2, dsh, dst, 0), nd(buf, 2, dsh, dst, 0)};
+  s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, dj, E8, NX_C_COST_BANDWIDTH,
+                  NULL);
+  check(s == NX_C_OK, "map accepts stepped windows that do not overlap");
+
+  /* map: a flipped output walks distinct cells backwards, so |stride| is what
+     the footprint test must read */
+  int64_t fsh[1] = {4}, fst[1] = {-1};
+  nx_c_ndarray fl[2] = {nd(out, 1, fsh, fst, 3), nd(buf, 1, fsh, ast1, 0)};
+  s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, fl, E8, NX_C_COST_BANDWIDTH,
+                  NULL);
+  check(s == NX_C_OK, "map accepts a flipped output");
 }
 
 CAMLprim value caml_nx_c_selftest(value unit) {
