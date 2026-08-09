@@ -833,13 +833,25 @@ static void nx_c_map_outer_body(int64_t lo, int64_t hi, int worker, void *vctx) 
    the run is threaded.
 
    Sort the dims by |stride| and require each to clear the footprint its
-   predecessors already cover. That decides aliasing exactly for every layout a
-   view can hold: strides come from a contiguous base through slicing,
-   transposition, flipping and windowing, so a dim either sits outside the span
-   below it or lands inside it. A broadcast dim (stride 0) fails against the
-   very first footprint, and an overlapping window fails as soon as its step
-   falls short of its window. Reading |stride| keeps a flipped output — whose
-   negative strides still enumerate distinct cells — admissible.
+   predecessors already cover. Sound for arbitrary strides: had two index
+   tuples collided, the largest differing dim would contribute at least its
+   own stride to the address difference while every smaller dim together
+   contributes strictly less, so no collision exists. Seeding [covered] with
+   the element size extends that from start addresses to whole byte extents,
+   |stride| admits a flipped output — negative strides still enumerate
+   distinct cells — and a broadcast dim (stride 0) fails against the very
+   first footprint. The verdict is also independent of how much the coalescer
+   merged: a merged pair contributes exactly its factors' combined footprint.
+
+   Sufficient, not exact: a dim can interleave with the span below it and
+   still address distinct cells — shape [3,2] with element strides [2,3]
+   addresses {0,2,3,4,5,7} yet is rejected. Reaching such a layout takes an
+   overlapping window later decimated back to disjointness; every chain of
+   shrink, flip, permute, stride-compatible reshape, stepped slice and
+   step-covers-window framing keeps accepted layouts accepted. The exact
+   decision is a bounded-Diophantine solve (what numpy's shares_memory runs),
+   deliberately not spent on a per-dispatch guard whose conservative miss is
+   a loud Invalid_argument on a write, never a silent admit.
 
    Runs on the coalesced output, where size-1 dims are already gone; the skip
    below only re-checks. */
@@ -870,6 +882,11 @@ static int nx_c_out_aliases(const nx_c_plan *p, int64_t elem_size) {
   int64_t covered = elem_size; /* the footprint one element already occupies */
   for (int i = 0; i < n; i++) {
     if (stride[i] < covered) return 1;
+    /* A wrapped accumulator would go negative and admit everything after it.
+       No view over a real allocation gets near the bound — only hand-built
+       strides do — but rejecting them keeps the soundness argument
+       unconditional. */
+    if (extent[i] - 1 > (INT64_MAX - covered) / stride[i]) return 1;
     covered += (extent[i] - 1) * stride[i];
   }
   return 0;

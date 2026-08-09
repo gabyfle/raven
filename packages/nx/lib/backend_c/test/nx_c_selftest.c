@@ -1011,6 +1011,18 @@ static void t_precondition_checks(void) {
   s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, fl, E8, NX_C_COST_BANDWIDTH,
                   NULL);
   check(s == NX_C_OK, "map accepts a flipped output");
+
+  /* map: interleaved strides — shape [3,2], element strides [2,3] — address
+     six distinct cells {0,2,3,4,5,7}, and the footprint test rejects them
+     anyway: it is sufficient, not exact. Pinned so an exact guard is a
+     deliberate flip of this expectation, not an accident. */
+  double io8[8] = {0};
+  int64_t ish[2] = {3, 2}, ist[2] = {2, 3}, ict[2] = {2, 1};
+  nx_c_ndarray iv[2] = {nd(io8, 2, ish, ist, 0), nd(buf, 2, ish, ict, 0)};
+  s = nx_c_map_run(&st_neg_table, NX_C_DTYPE_f64, 1, iv, E8, NX_C_COST_BANDWIDTH,
+                  NULL);
+  check(status_is(s, NX_C_ERR_OUT_ALIASED),
+        "map conservatively rejects interleaved disjoint strides");
 }
 
 CAMLprim value caml_nx_c_selftest(value unit) {
