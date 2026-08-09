@@ -307,7 +307,9 @@ let test_roundtrip_large () =
     [ 4096; 65536; 44100; 131042; 65535 ]
 
 (* ── Pad / truncate sweep ── Every even s in 4..64, from spectra shorter than,
-   equal to, and longer than the s/2+1 bins the reconstruction reads. *)
+   equal to, and longer than the s/2+1 bins the reconstruction reads. d = -1 is
+   the spectrum missing exactly its Nyquist bin, so the zero-fill loop runs
+   exactly once. *)
 
 let test_irfft_pad_truncate () =
   let s = ref 4 in
@@ -324,7 +326,7 @@ let test_irfft_pad_truncate () =
             (Printf.sprintf "irfft s=%d from %d bins" n len)
             1e-13 (irfft_oracle g n)
             (Nx.to_array (Nx.irfft Nx.float64 ~n ~norm:`Forward spec)))
-      [ -2; 0; 2 ];
+      [ -2; -1; 0; 2 ];
     s := !s + 2
   done
 
@@ -333,20 +335,28 @@ let test_irfft_pad_truncate () =
    reconstruction and numpy/pocketfft. *)
 
 let test_irfft_nonhermitian_edges () =
-  let n = 8 in
-  let half = 5 in
-  let g = csig 12000 half in
-  let dirty = Array.copy g in
-  dirty.(0) <- { (dirty.(0)) with Complex.im = 5.0 };
-  dirty.(4) <- { (dirty.(4)) with Complex.im = -3.0 };
-  let clean = Array.copy g in
-  clean.(0) <- { (clean.(0)) with Complex.im = 0.0 };
-  clean.(4) <- { (clean.(4)) with Complex.im = 0.0 };
-  exact_f "irfft discards Im DC and Im Nyquist"
-    (Nx.to_array
-       (Nx.irfft Nx.float64 ~n (Nx.create Nx.complex128 [| half |] clean)))
-    (Nx.to_array
-       (Nx.irfft Nx.float64 ~n (Nx.create Nx.complex128 [| half |] dirty)))
+  (* n=8 rides the packed even path; n=17 the full path through a Bluestein
+     plan, which reads every input slot and so only stays invariant because the
+     reconstruction discards the edge imaginaries before transforming. *)
+  List.iter
+    (fun n ->
+      let half = (n / 2) + 1 in
+      let g = csig (12000 + n) half in
+      let dirty = Array.copy g in
+      dirty.(0) <- { (dirty.(0)) with Complex.im = 5.0 };
+      let clean = Array.copy g in
+      clean.(0) <- { (clean.(0)) with Complex.im = 0.0 };
+      if n mod 2 = 0 then begin
+        dirty.(n / 2) <- { (dirty.(n / 2)) with Complex.im = -3.0 };
+        clean.(n / 2) <- { (clean.(n / 2)) with Complex.im = 0.0 }
+      end;
+      exact_f
+        (Printf.sprintf "irfft n=%d discards Im DC and Im Nyquist" n)
+        (Nx.to_array
+           (Nx.irfft Nx.float64 ~n (Nx.create Nx.complex128 [| half |] clean)))
+        (Nx.to_array
+           (Nx.irfft Nx.float64 ~n (Nx.create Nx.complex128 [| half |] dirty))))
+    [ 8; 17 ]
 
 (* ── Multi-axis irfft (keeps the complex temp for the non-last axes) ── *)
 
