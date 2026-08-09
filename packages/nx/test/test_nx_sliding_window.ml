@@ -136,9 +136,9 @@ let test_rfft_over_view () =
   let spectrum_copy = Nx.rfft Nx.complex128 (Nx.contiguous frames) ~axis:(-1) in
   check_nx ~epsilon:1e-12 "rfft over view vs copy" spectrum_copy spectrum_view
 
-(* An overlapping window is the one layout in Nx that addresses a single
-   element from several positions, so a write through it has no defined result.
-   The engine rejects it rather than racing; a view that steps at least its own
+(* An overlapping window is the one layout in Nx that addresses a single element
+   from several positions, so a write through it has no defined result. The
+   engine rejects it rather than racing; a view that steps at least its own
    width holds each element once and stays writable. *)
 let test_overlapping_view_rejects_writes () =
   let x = Nx.create Nx.float32 [| 5 |] [| 0.; 1.; 2.; 3.; 4. |] in
@@ -147,8 +147,8 @@ let test_overlapping_view_rejects_writes () =
   check_invalid_arg "blit into overlapping windows"
     "copy: output aliases one element onto several positions" (fun () ->
       Nx.blit source windows);
-  check_data "base is untouched by the rejected write"
-    [| 0.; 1.; 2.; 3.; 4. |] x
+  check_data "base is untouched by the rejected write" [| 0.; 1.; 2.; 3.; 4. |]
+    x
 
 let test_disjoint_view_accepts_writes () =
   let x = Nx.create Nx.float32 [| 6 |] [| 0.; 1.; 2.; 3.; 4.; 5. |] in

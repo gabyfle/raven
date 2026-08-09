@@ -3119,8 +3119,8 @@ val sliding_window_view :
                                               [5, 6]]
     ]}
 
-    See also {!extract_patches}, which gathers a copy and so is always
-    writable. *)
+    See also {!extract_patches}, which gathers a copy and so is always writable.
+*)
 
 (** {2:patches Patches} *)
 
