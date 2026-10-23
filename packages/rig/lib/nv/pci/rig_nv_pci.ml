@@ -39,13 +39,30 @@ let gib = 1 lsl 30
 (* The memory BAR, BAR 1. *)
 let memory_bar = 1
 
+(* NVIDIA's driver refuses to boot a GPU whose protected memory (WPR2) is up
+   (_kgspBootGspRm in kernel_gsp.c), and so does an open: a reset that leaves
+   it up, as a GPU whose stop could not take it down may keep it, leaves a GPU
+   neither can boot. *)
+let ready fn =
+  let* regs = Function.map ~combine:false fn 0 in
+  let up = Window.get32 regs Defs.nv_pfb_pri_mmu_wpr2_addr_hi <> 0 in
+  Function.unmap fn regs;
+  if not up then Ok ()
+  else
+    Error
+      (strf
+         "%s keeps its protected memory (WPR2) up after its reset, so no \
+          driver can boot it until a reset that takes WPR2 down, such as a \
+          power cycle"
+         (Function.bus fn))
+
 (* NVIDIA's driver holds no file of a GPU's devices past the process that opened
    it, and tells nothing of an unbound GPU. *)
 let gpus =
   Driver.make ~name:"NV-PCI" ~memory_bar:(Some memory_bar)
     ~siblings:Remove ~nodes:Held.nodes
     ~unreleased:(fun ~root:_ _ -> None)
-    ~teardown_ms:0 ~reset:Function.reset
+    ~teardown_ms:0 ~reset:Function.reset ~ready
     (fun (id : Machine.id) -> Rig_nv.is_gpu ~vendor:id.vendor ~class_:id.class_)
 
 let buses ?(machine = Machine.this) () = Driver.buses gpus machine
@@ -81,23 +98,28 @@ let survey ~firmware boot42 rom =
     | Ampere | Ada -> Result.map Option.some (Vbios.fwsec (rom ()))
   in
   let report = { chip = Chip.name family implementation; images } in
+  let parse ~gsp ~bootloader ~start unload =
+    let contents (i : Firmware.image) = i.contents in
+    Images.parse family ~gsp:(contents gsp) ~bootloader:(contents bootloader)
+      ~start:(contents start) ~unload:(Option.map contents unload)
+  in
   match List.map snd looked with
   | [ Ok gsp; Ok bootloader; Ok start ] ->
-      let* fw =
-        Images.parse family ~gsp:gsp.contents ~bootloader:bootloader.contents
-          ~start:start.contents
-      in
+      let* fw = parse ~gsp ~bootloader ~start None in
+      Ok (report, Ok (fw, fwsec))
+  | [ Ok gsp; Ok bootloader; Ok start; Ok unload ] ->
+      let* fw = parse ~gsp ~bootloader ~start (Some unload) in
       Ok (report, Ok (fw, fwsec))
   | rs -> (
       match
         List.find_map (function Error why -> Some why | Ok _ -> None) rs
       with
       | Some why -> Ok (report, Error why)
-      | None -> assert false (* three files, not all found *))
+      | None -> assert false (* each family's files, not all found *))
 
 let report ~firmware ~chip ~vbios =
   Rig_nv.Lock.check "Rig_nv_pci.report";
-  Result.map fst (survey ~firmware chip (fun () -> vbios))
+  Result.map fst (survey ~firmware chip (fun () -> Vbios.of_string vbios))
 
 (* Memory *)
 
@@ -106,8 +128,10 @@ let report ~firmware ~chip ~vbios =
    of memory the host addresses, and where an IOMMU maps device addresses.
    System memory lies at the same address for the process and the GPU, so the
    range is reserved on the GPU's machine. One range serves every GPU: a peer's
-   memory maps at its owner's address. *)
+   memory maps at its owner's address. It lies above the GSP's addresses
+   ({!Rpc.reserved}), which the GPU's tables must leave unmapped. *)
 let space = Space.create ~base:(64 * gib) (Rig_nv.windows - (64 * gib))
+let taken () = Space.taken space
 
 module Handles = Map.Make (Int)
 
@@ -240,6 +264,14 @@ let free g (m : Memory.region Rig_nv.memory) =
   Option.iter (fun n -> n.regions <- Handles.remove m.handle n.regions) g.names;
   Memory.free g.memory m.data
 
+(* Another function reaches the memory as a peer GPU does, at its runs through
+   the memory BAR, and rig.pci keeps them and the GPU's function for it until
+   the process exits. *)
+let dma g (m : Memory.region Rig_nv.memory) ~fn =
+  Result.map
+    (fun runs -> Rig_edge.Bus runs)
+    (protect g (fun () -> Memory.bus g.memory m.data ~client:fn))
+
 (* Faults, hangs and stops *)
 
 let check g gsp () =
@@ -266,16 +298,10 @@ let wpr2 c =
 
 (* A GSP that runs, booted by the GPU's kernel driver or a process, is reset
    before anything is written: the take proves no live process holds the GPU,
-   and no boot continues from another's GSP. *)
+   and no boot continues from another's GSP. The reset refuses a GPU it
+   leaves booted. *)
 let started hold (c : Chip.t) =
-  if not (Chip.booted c) then Ok ()
-  else
-    let* () = Driver.renew hold in
-    if not (Chip.booted c) then Ok ()
-    else
-      Error
-        (strf "%s still runs the GSP's firmware after its reset"
-           (Function.bus c.fn))
+  if Chip.booted c then Driver.renew hold else Ok ()
 
 let device ~word ~on g ~gsp ~hold ~tables (c : Chip.t) =
   let* () =
@@ -288,50 +314,63 @@ let device ~word ~on g ~gsp ~hold ~tables (c : Chip.t) =
   let* rm = Gsp.rm gsp ~locate:(locate g) in
   let* device, subdevice, vaspace = Gsp.objects rm in
   let* gpu = Gsp.gpu gsp rm ~subdevice in
-  (* The flush word's page lives with the GPU's memory until the stop. A GPU
-     whose BAR has no room for it opens without Mapped memory. *)
-  let* flush =
-    match protect g (fun () -> Memory.alloc g.memory Memory.Bar 0x1000) with
-    | Ok (Some r) -> Ok (host r)
-    | Ok None -> Ok None
-    | Error _ as e -> e
+  (* The flush word's page lives with the GPU's memory until the stop, which
+     gives back its addresses, as a device that fails to make does at once. A
+     GPU whose BAR has no room for it opens without Mapped memory. *)
+  let* page = protect g (fun () -> Memory.alloc g.memory Memory.Bar 0x1000) in
+  let free_page () =
+    Option.iter (fun r -> protect g (fun () -> Memory.free g.memory r)) page
   in
-  Rig_nv.make ~word
-    {
-      key = on.key;
-      index = g.index;
-      rm;
-      device;
-      subdevice;
-      vaspace;
-      gpu;
-      budget = Page_table.main_pool tables;
-      doorbell = Window.address c.regs + doorbell_at;
-      clock = Registers (Window.address c.regs);
-      flush;
-      alloc = alloc g;
-      (* A GPU taken physically would keep writing the process's pages after its
-         death: it maps no host memory. *)
-      map_host =
-        (match Function.addressing g.fn with
-        | Machine.Physical -> None
-        | Iommu -> Some (map_host g));
-      reaches = reaches on ~index:g.index;
-      map_peer = map_peer g;
-      free = free g;
-      register = (fun _ -> Ok ());
-      unregister = (fun _ -> Ok ());
-      check = check g gsp;
-      hang_ms = Some Driver.hang_ms;
-      stop =
-        (fun () ->
-          Fun.protect
-            (fun () -> Driver.stop hold)
-            ~finally:(fun () ->
-              protect g (fun () ->
-                  g.names <- None;
-                  Memory.release g.memory)));
-    }
+  let flush = Option.bind page host in
+  match
+    Rig_nv.make ~word
+      {
+        key = on.key;
+        index = g.index;
+        rm;
+        device;
+        subdevice;
+        vaspace;
+        gpu;
+        budget = Page_table.main_pool tables;
+        doorbell = Window.address c.regs + doorbell_at;
+        clock = Registers (Window.address c.regs);
+        flush;
+        alloc = alloc g;
+        (* A GPU taken physically would keep writing the process's pages after
+           its death: it maps no host memory. *)
+        map_host =
+          (match Function.addressing g.fn with
+          | Machine.Physical -> None
+          | Iommu -> Some (map_host g));
+        reaches = reaches on ~index:g.index;
+        map_peer = map_peer g;
+        free = free g;
+        bus = Some (Function.bus g.fn);
+        dma = dma g;
+        register = (fun _ -> Ok ());
+        unregister = (fun _ -> Ok ());
+        check = check g gsp;
+        hang_ms = Some Driver.hang_ms;
+        stop =
+          (fun () ->
+            Fun.protect
+              (fun () -> Driver.stop hold)
+              ~finally:(fun () ->
+                protect g (fun () ->
+                    g.names <- None;
+                    Memory.release g.memory);
+                free_page ()));
+      }
+  with
+  | Ok _ as d -> d
+  | Error _ as e ->
+      free_page ();
+      e
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      free_page ();
+      Printexc.raise_with_backtrace e bt
 
 (* [start] places the GSP's memory and boots it. Before the GSP's memory is
    taken, the start only reads the GPU's registers and writes its page tables in
@@ -346,8 +385,11 @@ let start h (c : Chip.t) (fw : Images.t) fwsec ~failed ~lock =
     Fb_layout.top (Chip.layout c.family) ~memory
       ~boot:fw.bootloader.image.length ~image:fw.gsp.length
   in
+  (* The GPU's MMU indexes each level with the address's own bits, from
+     address 0 (mmuFmtVirtAddrToEntryIndex), whatever part of the addresses
+     the space hands out. *)
   let tables =
-    Page_table.create (Mmu.format c bar ~failed) space ~memory:top
+    Page_table.create ~base:0 (Mmu.format c bar ~failed) space ~memory:top
       ~boot:(Gsp.boot_pool fw.start)
       ~tables:(if Window.length bar >= memory then Main else Pool)
       ~pages:(Page_entry.pages (Mmu.version c.family))

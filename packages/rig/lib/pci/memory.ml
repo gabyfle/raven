@@ -5,6 +5,7 @@
 
 let strf = Printf.sprintf
 let invalid_argf fmt = Printf.ksprintf invalid_arg fmt
+let ( let* ) = Result.bind
 
 type kind = Gpu | Bar | Host
 type link = { fabric : int64; node : int }
@@ -16,7 +17,8 @@ type reach = {
   addressing : Machine.addressing;
   small_bar : bool;
   link : link option;
-  route : Sysfs.route option; (* its way up the bus, without a transport *)
+  route : Sysfs.route option Lazy.t;
+      (* its way up the bus, without a transport, read at its first use *)
 }
 
 (* The memory a GPU addresses: the facts [reaches] and errors read, and [held],
@@ -40,6 +42,9 @@ and held = {
   regions : shared Tables.Address.t;
   mutable unconfirmed : region list;
   mutable tables : Page_table.t option; (* [None] once released *)
+  mutable given : int list;
+      (* the GPU addresses of the mappings [bus] gave another function, which
+         nothing gives back *)
 }
 
 (* A region maps [mapping] for [owner]'s GPU. Its first byte lies [off] bytes
@@ -92,9 +97,10 @@ let create ?link fn tables ~bar =
         small_bar = bar_size < Page_table.memory tables;
         link;
         route =
-          Option.bind
-            (Machine.files (Function.machine fn))
-            (fun files -> Sysfs.route files (Function.bus fn));
+          lazy
+            (Option.bind
+               (Machine.files (Function.machine fn))
+               (fun files -> Sysfs.route files (Function.bus fn)));
       };
     bar;
     bar_base;
@@ -106,6 +112,7 @@ let create ?link fn tables ~bar =
           regions = Tables.Address.create 64;
           unconfirmed = [];
           tables = Some tables;
+          given = [];
         };
   }
 
@@ -144,6 +151,12 @@ let rec host r =
 
 let reach m = m.reach
 
+(* A route is read from the machine's files when a peer or another function
+   first needs it, which a session that reaches neither never does: 4 ms of an
+   open on an R9700. Its lock lets two domains ask at once. *)
+let routes = Lock.create ()
+let route (r : reach) = Lock.protect routes (fun () -> Lazy.force r.route)
+
 let linked (r : reach) (o : reach) =
   match (r.link, o.link) with
   | Some l, Some l' -> Int64.equal l.fabric l'.fabric
@@ -152,7 +165,7 @@ let linked (r : reach) (o : reach) =
 (* Whether the bus carries [r]'s requests to [o]'s BAR, which only a machine
    reached without a transport tells. *)
 let carried (r : reach) (o : reach) =
-  match (r.route, o.route) with
+  match (route r, route o) with
   | Some client, Some provider -> Sysfs.forwards ~provider ~client
   | _ -> false
 
@@ -408,16 +421,28 @@ let map_new m h tables r =
                         }))))
 
 (* Misuse is refused before anything is pinned or written: a region freed, or
-   its origin freed. Memory the GPU maps already, its own or a peer's it
-   mapped, lies at its owner's address, so a new region there shares that
-   mapping. *)
+   its origin freed. A released GPU's own memory is refused: another open may
+   have reset that GPU and given the memory out. Its system memory stays until
+   its region's free, and maps as a live GPU's does. Memory the GPU maps
+   already, its own or a peer's it mapped, lies at its owner's address, so a
+   new region there shares that mapping. *)
 let map_peer m r =
   let h, tables = live "map_peer" m in
   ignore (mine "map_peer" r.owner r : held);
   let r = origin r in
-  ignore (live "map_peer" r.owner : held * Page_table.t);
-  ignore (mine "map_peer" r.owner r : held);
+  let owner = mine "map_peer" r.owner r in
+  let gone =
+    m.reach.machine == r.owner.reach.machine
+    && r.mapping.target <> System
+    && Function.released owner.fn
+  in
   match Tables.Address.find_opt h.regions r.mapping.va with
+  | _ when gone ->
+      Error
+        (strf
+           "%s was released, and another open may have reset it and given its \
+            memory out"
+           r.owner.reach.bus)
   | None -> map_new m h tables r
   | Some e when origin e.holder != r ->
       invalid_argf "Memory.map_peer: %s maps other memory at 0x%x" m.reach.bus
@@ -434,6 +459,88 @@ let map_peer m r =
       in
       e.out <- p :: e.out;
       Ok (Some p)
+
+(* Giving memory to another function
+
+   Another function of the machine, such as a network adapter, reaches GPU
+   memory at its bus address through the memory BAR, as a peer GPU does
+   ([map_new]), and system memory at its physical address. Neither request
+   may cross an IOMMU that translates it, and a BAR request must take a route
+   Linux's p2pdma allows (drivers/pci/p2pdma.c). The function's writes go to
+   the memory itself, whatever the GPU's tables say, and nothing tells this
+   library when they stop: so the memory is never given back, and the GPU's
+   function stays the process's ([Function.keep]). *)
+
+let refuse fmt = Printf.ksprintf (fun s -> Error s) fmt
+
+let reach_check m files ~client =
+  let gpu = m.reach.bus in
+  if m.reach.addressing = Machine.Iommu then
+    refuse
+      "%s is behind an IOMMU, which translates its requests and not another \
+       function's"
+      gpu
+  else if Sysfs.translates files client then
+    refuse "%s is behind an IOMMU, which translates its requests" client
+  else Ok ()
+
+let bar_check m files ~client =
+  let gpu = m.reach.bus in
+  if m.reach.small_bar then
+    refuse
+      "%s's memory BAR is smaller than its memory; Resizable BAR in the \
+       firmware settings makes it as large"
+      gpu
+  else
+    match (route m.reach, Sysfs.route files client) with
+    | Some provider, Some client when Sysfs.forwards ~provider ~client -> Ok ()
+    | _ ->
+        refuse
+          "the bus does not carry %s's requests to %s's memory BAR, as Linux's \
+           p2pdma decides"
+          client gpu
+
+let known m client =
+  match Machine.functions m.reach.machine with
+  | Error why ->
+      refuse "listing the functions of %s's machine: %s" m.reach.bus why
+  | Ok ids when List.exists (fun (id : Machine.id) -> id.bus = client) ids ->
+      Ok ()
+  | Ok _ -> refuse "%s names no PCI function of %s's machine" client m.reach.bus
+
+let bus m r ~client =
+  let h, _ = live "bus" m in
+  ignore (mine "bus" m r : held);
+  if r.source <> Allocated then
+    invalid_argf "Memory.bus: the memory at 0x%x is not memory alloc gave"
+      r.mapping.va;
+  let* () =
+    if Option.is_none (Bus_address.numbers client) then
+      refuse "%S is no PCI bus address, expected DDDD:BB:DD.F" client
+    else Ok ()
+  in
+  let* files =
+    match Machine.files m.reach.machine with
+    | Some files -> Ok files
+    | None ->
+        refuse
+          "%s's machine is reached through a transport, which no other \
+           function's requests cross"
+          m.reach.bus
+  in
+  let* () = known m client in
+  let* () = reach_check m files ~client in
+  let map = r.mapping in
+  let* runs =
+    match map.target with
+    | Page_table.System -> Ok map.pages
+    | Gpu | Peer _ ->
+        let* () = bar_check m files ~client in
+        Ok (List.map (fun (pa, n) -> (pa + m.bar_base, n)) map.pages)
+  in
+  if not (List.mem map.va h.given) then h.given <- map.va :: h.given;
+  Function.keep h.fn;
+  Ok runs
 
 (* Freeing *)
 
@@ -463,7 +570,9 @@ let free m r =
   let e = Tables.Address.find h.regions r.mapping.va in
   e.out <- List.filter (fun r' -> r' != r) e.out;
   let tables = if Function.released h.fn then None else h.tables in
-  if e.out = [] then begin
+  if e.out = [] && List.mem r.mapping.va h.given then
+    Tables.Address.remove h.regions r.mapping.va
+  else if e.out = [] then begin
     Tables.Address.remove h.regions r.mapping.va;
     let r = e.holder in
     let confirmed =

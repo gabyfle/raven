@@ -161,6 +161,16 @@
     access between two GPUs, with the flushes of each other's host writes,
     is untested, and so is a path whose [hdp] is [None].
 
+    {!val-dma} is the path's answer ([dma] of {!type-path}), or [Error]
+    where the path gives no register that flushes the GPU's host data path
+    ([hdp] of {!type-path}), since another function's writes through the
+    memory BAR pass it as the host's do. Once a region is given, each
+    submission flushes that path before the GPU reads, for the rest of the
+    process, so the device's later work reads what the function wrote. The
+    function reads what a value's work wrote once the value is reached,
+    since its release writes the L2 back, and the host data path of the
+    GPUs this driver drives keeps no read cache to invalidate.
+
     {!val-map_host} returns a region the GPU addresses, or [None] if the
     path maps no host memory or refuses the pages. Both paths map host
     pages for writing, so it returns [None] for pages mapped read-only,
@@ -234,7 +244,8 @@ val capability : t -> Rig_amd_abi.Capability.t
        the GPU, at addresses that start on one;}
     {- [capability], {!capability}, declared with
        {!Rig_amd_abi.declare};}
-    {- [word], the device's timeline word, as {b Word.} below states.}}
+    {- [word], the device's timeline word, as {b Word.} below states;}
+    {- [bus], the path's [bus], the GPU's PCI function.}}
 
     {b Capability.} The record holds the GPU, its clock, its compute queue's
     packets, its work-group processors that run work, and its trace buffers,
@@ -358,10 +369,17 @@ val capability : t -> Rig_amd_abi.Capability.t
     {!type-clock} says, and converts a stamp along the line through its
     first measure, at open, and its latest, once they lie a second apart,
     and at [clock_hz] from the latest before. A measure through a {!Source}
-    takes the time of a host clock between two readings of it. A re-measure
-    whose readings lie more than 10 µs apart is dropped, and the measure at
-    open keeps the first of sixteen reads within 10 µs, or the narrowest,
-    which the first re-measure within 10 µs replaces. A time is thus within
+    takes the time of a host clock between two readings of it. A source may
+    count another counter of the clock's rate, a constant apart from the
+    clock, as KFD's does on GFX 12: the device takes the constant
+    once, at open, from stamps its compute queue writes between two
+    readings of the host's clock, the closest pair of eight, against a read
+    of the source, and adds it to every read. That read is the first of
+    sixteen before the stamps within 10 µs, else the first of sixteen after
+    them within 10 µs, else the narrowest; it is also the measure at open,
+    which, if wider than 10 µs, the first re-measure within 10 µs replaces
+    in the line. A re-measure whose readings lie more than 10 µs apart is
+    dropped. A time is thus within
     its measure's deviation plus the line's rate error over the time since
     the latest measure, at most 62.5 ms. A measure's deviation is half its
     interval, 5 µs once a measure within the bound is taken. The rate error
@@ -372,9 +390,17 @@ val capability : t -> Rig_amd_abi.Capability.t
     host's clock with a pair of readings of its own. A measure's deviation
     is then half its interval plus KFD's gap between the counter read and
     its host sample. That gap is one-sided, usually one register read, and
-    unbounded under preemption. With {!Round_trip} the device measures at
-    open only, and its times drift from the host's clock at the clock's
-    rate error since open.
+    unbounded under preemption. Through a {!Source} a time also holds the
+    constant's error: half the stamps' interval plus the deviation of the
+    read it was taken against, for the device's life. The constant stays
+    fixed for that life, and a counter that moved against the clock would
+    shift every time by the move: a conversion that puts a value's start
+    before its [submit], or its end after the conversion, by more than
+    1 ms leaves both its times [0], as for work the device cannot time, so
+    a profile records no [Work] for it ({!Rig.Profile.type-event}). A late
+    read of the source, as KFD's under preemption, does the same. With
+    {!Round_trip} the device measures at open only, and its times drift
+    from the host's clock at the clock's rate error since open.
 
     {2:stop Stop}
 
@@ -417,8 +443,10 @@ type clock =
   | Source of int
       (** The address of the path's [struct rig_amd_clock] ([rig_amd.h]),
           which the path keeps while a device may read it. A device reads
-          it at open and again in [rig_amd_settle], at most every
-          62.5 ms. *)
+          it at open and again in [rig_amd_settle] and in a [rig_amd_submit]
+          that converts an earlier value's stamps, at most every 62.5 ms,
+          and takes at open the constant between its counter and the clock
+          ({!section-c}). *)
   | Round_trip
       (** The device measures at open only, with a stamp its compute queue
           writes between two readings of the host's clock, the closest of
@@ -484,6 +512,14 @@ type 'm path = {
           nothing, and [free] of it gives nothing back. *)
   free : 'm memory -> unit;
       (** [free m] gives back what [alloc], [map_host] or [map_peer] gave. *)
+  bus : string option;
+      (** The bus address of the GPU's PCI function on its machine. *)
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
+      (** [dma m ~fn] is how the function at [fn] reaches the memory [m] that
+          [alloc] gave, as {!Rig_edge.Driver.val-dma} states, or [Error]
+          with the path's reason. The path keeps the memory where it lies:
+          it refuses where [fn] would reach GPU memory only once the memory
+          moved. *)
   queue :
     [ `Pm4 | `Aql | `Sdma ] ->
     ring:int ->
@@ -530,10 +566,19 @@ type 'm path = {
           where nothing else bounds the GPU's work; [None] where the path's
           kernel driver does. It is the [hang_ms] of the device's facts
           ({!Rig_edge.type-facts}). *)
-  sleep : ms:int -> unit;
-      (** [sleep ~ms] returns once the GPU interrupts, or after [ms]
-          milliseconds. It raises {!Fault} with the path's report of a fault
-          of the GPU's work. *)
+  interrupts : unit -> int;
+      (** [interrupts ()] is the path's count of the interrupts its sleeps
+          took and the faults they recorded, as [sleep] compares it. *)
+  sleep : ms:int -> after:int -> unit;
+      (** [sleep ~ms ~after] returns once the GPU interrupts, at once if a
+          sleep of the path, in any domain, took an interrupt or recorded a
+          fault since [interrupts ()] was [after], or after [ms]
+          milliseconds. {!val-sleep} reads [after] before it reads the word
+          it sleeps on, so a release after that read wakes the sleep even
+          when another domain's sleep took its interrupt. A path that cannot
+          keep the count must say which sleeps may wait out [ms] instead. It
+          raises {!Fault} with the path's report of a fault of the GPU's
+          work. *)
   stable_power : unit -> (unit, string) result;
       (** [stable_power ()] holds the GPU's clocks and shader engines steady,
           as tracing needs, for the life of the process. *)
@@ -643,6 +688,12 @@ end
 
 (**/**)
 
+(* [hold_sleeps f] makes each later {!val-sleep} that reads the word unmoved
+   call [f ()] before the path's sleep, until the next [hold_sleeps]: a test
+   holds one domain's sleep there while another domain's sleep takes the
+   interrupt. [hold_sleeps ignore] holds none. Any domain may call it. *)
+val hold_sleeps : (unit -> unit) -> unit
+
 (* [renumber g v] makes [v] the value after [g]'s last one: the timeline word
    and the last value given become [v - 1]. [g] is idle: its word holds the
    last value it was given. Tests reach the values a long run reaches, such as
@@ -655,8 +706,31 @@ val renumber : t -> int -> unit
 (* [ring g q] is [(n, size)]: the 32-bit words [g] placed on the ring of its
    queue [q] since it made the ring, and the ring's size in words. A word's
    place on the ring is its count modulo [size]. Tests check that their
-   submissions wrapped a ring.
+   submissions wrapped a ring. While another domain submits, [n] may be an
+   earlier count.
 
    Raises [Invalid_argument] if [g] has stopped, if it has no queue [q], or
    from a callback inside a lock ({!Lock.check}). *)
 val ring : t -> string -> int * int
+
+(* [segment g] is the bytes of [g]'s argument segment. Tests check that their
+   submissions grew it.
+
+   Raises [Invalid_argument] if [g] has stopped, or from a callback inside a
+   lock ({!Lock.check}). *)
+val segment : t -> int
+
+(* [set_first_sizes ~compute ~copy ~segment] makes the first compute ring,
+   copy ring and argument segment of a device made from then on [compute],
+   [copy] and [segment] bytes, a ring no larger than the most its path makes,
+   and is the sizes it replaces: [(16 MiB, 16 MiB, 2 MiB)] until a call. A
+   test shrinks them so that small submissions reach the growths of rings and
+   segment. A path that makes one queue of a kind, as SDMA 4 over PCI does
+   for copies, cannot grow that kind's ring, and its most is the default
+   first: a smaller first there makes room ask for a growth that faults, so
+   a test leaves that ring at its default. Any domain may call it.
+
+   Raises [Invalid_argument] if a size is not a power of two of at least
+   4096 bytes. *)
+val set_first_sizes :
+  compute:int -> copy:int -> segment:int -> int * int * int

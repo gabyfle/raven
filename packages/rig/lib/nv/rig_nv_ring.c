@@ -16,9 +16,9 @@
    invalidation come after the waits, once every earlier value's work is
    done.
 
-   Routes: a copy of one row within this device's Device memory from
-   256 KiB runs the driver's copy kernel on COMPUTE, as a launch; every
-   other part runs on its queue's channel. Each part's route is decided
+   Routes: a copy or a fill of one row within this device's Device memory
+   from 256 KiB runs the driver's copy or fill kernel on COMPUTE, as a
+   launch; every other part runs on its queue's channel. Each part's route is decided
    once, before any word is written.
 
    Joins: a part that a later part on the other channel runs after (one
@@ -31,7 +31,16 @@
    (COMPUTE when there is none, or when v's low 32 bits are 0) waits for
    the other channel's last part, then releases v into the timeline word:
    on COMPUTE a release that waits for the channel to be idle, on COPY a
-   release after its copies completed.
+   release after its copies completed. An untimed submission on COMPUTE
+   alone whose last part is a launch, of a value whose low 32 bits are not
+   0, has that launch's descriptor release v instead, as the launch
+   completes: the launch starts once every earlier launch of the
+   submission completed, chained or after a wait for idle. NVIDIA does not
+   state that a descriptor writes its 64-bit release as one store; with v's
+   low 32 bits not 0, v-1 and v share their high word, so one written in two
+   stores still moves the word from v-1 to v. That release leaves the
+   channel running, so the channel's next submission waits for
+   v first, as one after the other channel's release does.
 
    Order: the parts on one channel run in array order. COPY runs its copies
    one after another; on COMPUTE a part placed after launches the channel
@@ -135,18 +144,25 @@ static void reclaim(const struct device *d, struct channel *c,
   }
 }
 
-/* Below this size, launching the kernel costs more than the copy saves. */
+/* Below this size, launching a kernel costs more than it saves over the
+   copy engine, which writes bytes as fast whether it copies or fills. */
 enum { COPY_KERNEL_BYTES = 256 * 1024 };
 
-/* The copy kernel's parameters: destination, source and bytes. */
+/* The kernels' parameters: destination, then source or byte, then bytes. */
 enum { COPY_PARAMS = 3 * sizeof(uint64_t) };
 
-/* Whether the driver's copy kernel runs [p]: a copy within this device's
-   Device memory, large enough to pay for its launch. */
+/* The driver's kernel for the copy part [p], a copy or a fill, if it has
+   one. */
+static const struct launch *kernel_of(const struct device *d,
+                                      const struct rig_part *p) {
+  return p->copy.fill ? d->fill_launch : d->copy_launch;
+}
+
+/* Whether the driver's kernel runs [p]: a copy or a fill of one row within
+   this device's Device memory, large enough to pay for its launch. */
 static int kernel_copies(const struct device *d, const struct rig_part *p) {
-  return p->kind == RIG_COPY && !p->copy.fill && p->copy.rows == 1 &&
-         p->copy.device_memory && p->copy.width >= COPY_KERNEL_BYTES &&
-         d->copy_launch != NULL;
+  return p->kind == RIG_COPY && p->copy.rows == 1 && p->copy.device_memory &&
+         p->copy.width >= COPY_KERNEL_BYTES && kernel_of(d, p) != NULL;
 }
 
 /* Decides the routes of [p]'s parts into [r], the submission's scratch. The
@@ -383,7 +399,7 @@ static struct cost need(const struct device *d, int nwaits,
       l = p[i].launch.launch;
       params = p[i].launch.args.params;
     } else if (x->kernel) {
-      l = d->copy_launch;
+      l = kernel_of(d, &p[i]);
       params = COPY_PARAMS;
     } else if (p[i].kind == RIG_COPY)
       copies = copy_bytes(d, &p[i]);
@@ -832,17 +848,31 @@ static void values_of(const struct rig_block *b, uint64_t bank, uint64_t *v) {
   v[V_NEXT] = 0;
 }
 
-/* Writes [o]'s descriptor, chaining the descriptor at [next] if not 0, and
-   leaves no launch open. Built on the stack, then copied, so that the
-   ring's memory is only written. */
-static void settle(const struct channel *c, struct pending *o, uint64_t next) {
-  if (o->l == NULL) return;
+/* Writes [o]'s descriptor from [s], and leaves no launch open. Built on
+   the stack, then copied, so that the ring's memory is only written. */
+static void write_qmd(const struct channel *c, struct pending *o,
+                      const struct template *s) {
   uint8_t w[STRUCTURE_BYTES];
-  o->v[V_NEXT] = next == 0 ? 0 : gpu_at(c, next);
-  const struct template *s = &o->l->qmd[o->v[V_SHARED] > 0][next != 0];
   rig_nv_fill(s, o->v, w);
   memcpy(host_at(c, o->qmd), w, s->nbytes);
   o->l = NULL;
+}
+
+/* Writes [o]'s descriptor, chaining the descriptor at [next] if not 0. */
+static void settle(const struct channel *c, struct pending *o, uint64_t next) {
+  if (o->l == NULL) return;
+  o->v[V_NEXT] = next == 0 ? 0 : gpu_at(c, next);
+  write_qmd(c, o, &o->l->qmd[o->v[V_SHARED] > 0][next != 0]);
+}
+
+/* Writes [o]'s descriptor, which writes [v] at [word] as its launch
+   completes. */
+static void settle_releasing(const struct channel *c, struct pending *o,
+                             uint64_t word, uint64_t v) {
+  o->v[V_NEXT] = 0;
+  o->v[V_WORD] = word;
+  o->v[V_VALUE] = v;
+  write_qmd(c, o, &o->l->released[o->v[V_SHARED] > 0]);
 }
 
 /* Places a launch of [l] over [b] on COMPUTE, after [waited] says its part
@@ -886,8 +916,8 @@ static void launch(struct submission *s, const struct rig_part *p,
   rig_params(params, &a, args, slots);
 }
 
-/* Each thread copies vectors in a grid-stride loop; a bounded grid makes a
-   large copy take a fixed amount of scheduling work. */
+/* Each thread copies or sets vectors in a grid-stride loop; a bounded grid
+   makes a large copy take a fixed amount of scheduling work. */
 #define COPY_THREADS 256
 #define COPY_GROUPS 256
 #define COPY_VECTOR_BYTES 16
@@ -899,9 +929,10 @@ static void copy_compute(struct submission *s, const struct rig_part *p,
   struct rig_block b = {
       .groups = {groups < COPY_GROUPS ? (uint32_t)groups : COPY_GROUPS, 1, 1},
       .threads = {COPY_THREADS, 1, 1}};
-  uint64_t params[3] = {p->copy.dst + p->copy.dst_offset,
-                        p->copy.src + p->copy.src_offset, p->copy.width};
-  memcpy(dispatch(s, s->d->copy_launch, &b, sizeof params, waited), params,
+  uint64_t from =
+      p->copy.fill ? p->copy.byte : p->copy.src + p->copy.src_offset;
+  uint64_t params[3] = {p->copy.dst + p->copy.dst_offset, from, p->copy.width};
+  memcpy(dispatch(s, kernel_of(s->d, p), &b, sizeof params, waited), params,
          sizeof params);
 }
 
@@ -1009,15 +1040,20 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
       }
     }
   }
-  settle(compute, &s.open, 0);
-  enter(&s, r);
   int o = other(r);
-  if (s.used[o])
-    emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), joined(&s, last[o]), 0);
-  if (s.timed != NULL)
-    stamp(d, r, records(d, s.timed) + offsetof(struct stamps, end), v);
-  signal_word(d, r, d->word_gpu, v);
-  d->ch[r].released = v;
+  if (r == COMPUTE && s.open.l != NULL && !s.used[o] && s.timed == NULL &&
+      (uint32_t)v != 0)
+    settle_releasing(compute, &s.open, d->word_gpu, v);
+  else {
+    settle(compute, &s.open, 0);
+    enter(&s, r);
+    if (s.used[o])
+      emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), joined(&s, last[o]), 0);
+    if (s.timed != NULL)
+      stamp(d, r, records(d, s.timed) + offsetof(struct stamps, end), v);
+    signal_word(d, r, d->word_gpu, v);
+    d->ch[r].released = v;
+  }
   for (int q = 0; q < CHANNELS; q++) {
     if (!s.used[q]) continue;
     struct channel *c = &d->ch[q];

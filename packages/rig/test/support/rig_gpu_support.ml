@@ -36,6 +36,108 @@ end
 
 let opened (o : _ Rig_edge.opener) = o.make ~word:(Host.word ())
 
+(* Dma-bufs *)
+
+module Dmabuf = struct
+  external read : int -> int -> int -> string option = "rig_gpu_dmabuf_read"
+  external cloexec : int -> bool = "rig_gpu_cloexec"
+  external close : int -> unit = "rig_gpu_close"
+
+  let read fd ~at n = read fd at n
+
+  (* fdinfo's lines are "key:\tvalue". *)
+  let size fd =
+    match
+      In_channel.with_open_text
+        (Printf.sprintf "/proc/self/fdinfo/%d" fd)
+        In_channel.input_all
+    with
+    | exception Sys_error _ -> None
+    | s ->
+        let field k =
+          String.split_on_char '\n' s
+          |> List.find_map (fun line ->
+              match String.index_opt line ':' with
+              | Some i when String.sub line 0 i = k ->
+                  Some
+                    (String.trim
+                       (String.sub line (i + 1) (String.length line - i - 1)))
+              | _ -> None)
+        in
+        if field "exp_name" = None then None
+        else Option.bind (field "size") int_of_string_opt
+end
+
+(* A BAR's bus address is the start of its line of the function's [resource]
+   file, "0xSTART 0xEND 0xFLAGS". *)
+let bar_base bus bar =
+  let lines =
+    In_channel.with_open_text
+      (Printf.sprintf "/sys/bus/pci/devices/%s/resource" bus)
+      In_channel.input_lines
+  in
+  Scanf.sscanf (List.nth lines bar) "%x" Fun.id
+
+let bar_bytes bus ~bar runs n =
+  let base = bar_base bus bar in
+  let fd =
+    Unix.openfile
+      (Printf.sprintf "/sys/bus/pci/devices/%s/resource%d" bus bar)
+      [ O_RDONLY ] 0
+  in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let out = Buffer.create n in
+  List.iter
+    (fun (a, k) ->
+      let k = Int.min k (n - Buffer.length out) in
+      if k > 0 then begin
+        let m =
+          Bigarray.array1_of_genarray
+            (Unix.map_file fd
+               ~pos:(Int64.of_int (a - base))
+               Bigarray.char Bigarray.c_layout false [| k |])
+        in
+        for i = 0 to k - 1 do
+          Buffer.add_char out m.{i}
+        done
+      end)
+    runs;
+  Buffer.contents out
+
+let has ~sub s =
+  let n = String.length sub in
+  let rec at i =
+    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+  in
+  at 0
+
+(* A child skips with this exit code, automake's for a skipped test, its
+   reason on its standard output. *)
+let skip_exit = 77
+
+let child flag =
+  let exe = Sys.executable_name in
+  let from, into = Unix.pipe ~cloexec:true () in
+  let pid =
+    Unix.create_process exe [| exe; flag |] Unix.stdin into Unix.stderr
+  in
+  Unix.close into;
+  let said = In_channel.input_all (Unix.in_channel_of_descr from) in
+  Unix.close from;
+  match snd (Unix.waitpid [] pid) with
+  | WEXITED c when c = skip_exit -> skip ~reason:said ()
+  | WEXITED 0 -> print_string said
+  | WEXITED c ->
+      print_string said;
+      failf "the child exited with %d" c
+  | WSIGNALED _ | WSTOPPED _ ->
+      print_string said;
+      fail "a signal ended the child"
+
+let skipped why =
+  print_string why;
+  exit skip_exit
+
 let still ?msg w x f ~ms =
   let t0 = Rig.Profile.now () in
   while Rig.Profile.now () - t0 < ms * 1_000_000 do
@@ -151,6 +253,8 @@ module type S = sig
   val stop_driver : gpu -> unit
   val handed : string -> t
   val with_driver : (gpu -> 'a) -> 'a
+  val with_shared : (t -> 'a) -> 'a
+  val with_shared_driver : (gpu -> 'a) -> 'a
   val release : unit -> unit
   val submit : t -> Rig.Submission.part array -> Rig.Point.t
   val submit_work : t -> work list -> Rig.Point.t
@@ -269,6 +373,43 @@ module Make (G : Gpu) = struct
   let with_driver f =
     let g = driver () in
     Fun.protect ~finally:(fun () -> stop_driver g) (fun () -> f g)
+
+  (* The last shared open, alive while it is what the last open made: any other
+     open or release ends it first. A case that raises ends it, so that the
+     next case, a shrink's included, starts on a device the failure did not
+     leave behind. *)
+  let shared_rig = ref None
+  let shared_alone = ref None
+
+  let sharing f t =
+    match f t with
+    | v -> v
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        release ();
+        Printexc.raise_with_backtrace e bt
+
+  let with_shared f =
+    let t =
+      match (!shared_rig, !opened) with
+      | Some t, In_rig d when d == t.d -> t
+      | _ ->
+          let t = open_ () in
+          shared_rig := Some t;
+          t
+    in
+    sharing f t
+
+  let with_shared_driver f =
+    let g =
+      match (!shared_alone, !opened) with
+      | Some g, Alone a when a == g -> g
+      | _ ->
+          let g = driver () in
+          shared_alone := Some g;
+          g
+    in
+    sharing f g
 
   let submit t ps =
     let s = Rig.Submission.make t.d ps in

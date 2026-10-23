@@ -19,7 +19,9 @@
       and the kernel driver has let go of it. A process can then take it.
     - A function is {e held} by this process while a driver drives it
       ({!type-hold}). No other open of the function succeeds, and no change to
-      the machine touches it.
+      the machine touches it. Once an exception ended its stop as it gave the
+      function back ({!stop}), the process holds it until it exits, and none
+      of its opens or changes of the function succeeds.
     - A function is {e lost} once a hold has ended without a clean stop, or a
       reset of it has failed. Its next open renews it ({!renew}).
 
@@ -46,7 +48,16 @@ type siblings =
   | Remove
       (** {!detach} removes them from the machine until {!attach} or a reboot.
           Behind an IOMMU that translates, it binds them to [vfio-pci] with the
-          function instead, and {!attach} gives them back to their drivers. *)
+          function instead, and {!attach} gives them back to their drivers.
+
+          A kernel driver may read the data of the drivers of its device's
+          other functions as its own driver's for as long as it is bound, as
+          NVIDIA's reads an audio function's as a sound card's. So {!detach}
+          and {!attach} never bind one of them to [vfio-pci] while the
+          function's kernel driver is bound, ones that fail included, and take
+          each off [vfio-pci] before that driver's probe or unbind. A
+          {!detach} that returns [Error] changes nothing, so it leaves such a
+          function on [vfio-pci] where it found it. *)
   | Keep
       (** {!detach} leaves them, and refuses a function that is not bound to
           [vfio-pci] while its device has any and Linux resets it through its
@@ -61,12 +72,13 @@ val make :
   unreleased:(root:string -> string -> string option) ->
   teardown_ms:int ->
   reset:(Function.t -> (unit, string) result) ->
+  ready:(Function.t -> (unit, string) result) ->
   (Machine.id -> bool) ->
   t
 (** [make ~name ~memory_bar ~siblings ~nodes ~unreleased ~teardown_ms ~reset
-     matches] is the driver of the functions [f] with [matches f], named after
-    [name] ({!val-name}). [nodes] and [unreleased] read the machine's files
-    under [root], which is ["/"] for {!Machine.this}.
+     ~ready matches] is the driver of the functions [f] with [matches f],
+    named after [name] ({!val-name}). [nodes] and [unreleased] read the
+    machine's files under [root], which is ["/"] for {!Machine.this}.
     - [memory_bar] is the BAR through which the process reaches the function's
       memory, which {!detach} enlarges, or [None] for a function with no memory
       to reach.
@@ -87,7 +99,12 @@ val make :
       ran on it before, its kernel driver included, and reset it as its vendor
       does. It returns [Ok ()] once the function answers again with nothing
       running on it, or [Error why]. The function's bus mastering is off when
-      [reset] is called. *)
+      [reset] is called.
+    - [ready fn] is [Ok ()] if the function [fn], just reset, can serve its
+      kernel driver and an open, and [Error why] if not, such as an NVIDIA GPU
+      whose reset left its protected memory up. It is asked after each reset
+      that returns [Ok ()], once the memory dead processes left for the
+      function has gone, and a function it refuses is lost. *)
 
 val name : t -> int -> string
 (** [name d i] is the name of function [i]. It is [name] of {!make} for [0],
@@ -163,11 +180,14 @@ val stop : hold -> [ `Stopped | `Unknown ]
     driver's stop returned [`Lost] or [`Unknown]. [stop h] is [`Unknown] iff the
     driver's stop returned [`Unknown], and [`Stopped] otherwise. Later calls
     return what the first returned and call no driver's stop, and a call while
-    another runs waits for it and returns the same. Where the first raised as it
-    released the function, as one from a callback inside a lock of this
-    library's on the same thread does, the next call releases it. An exception
-    raised by the driver's stop passes through, and the function is lost. A
-    device calls [stop] once its work is done or lost. *)
+    another runs waits for it and returns the same. Where the first raised
+    before it released the function, as one from a callback inside a lock of
+    this library's on the same thread does, the next call releases it. Where an
+    exception, such as an asynchronous one ({!Sys.Break}), ended the release
+    ({!Function.release}), the process holds the function until it exits, and
+    {!open_}, {!reset}, {!detach} and {!attach} of it fail, saying so. An
+    exception raised by the driver's stop passes through, and the function is
+    lost. A device calls [stop] once its work is done or lost. *)
 
 val renew : hold -> (unit, string) result
 (** [renew h] resets the function [h] holds as its vendor does ([reset] of
@@ -176,8 +196,9 @@ val renew : hold -> (unit, string) result
     driver calls [renew] from its [f], before it keeps any of the function's
     state, when it finds the function running firmware it cannot continue from.
 
-    [Error why] with the reset's reason. The open then loses the function,
-    whatever its [f] returns. An exception raised by the reset passes through,
+    [Error why] with the reset's reason, or with [ready]'s ({!make}) if it
+    refuses the function. The open then loses the function, whatever its [f]
+    returns. An exception raised by the reset or by [ready] passes through,
     and the function is lost the same way. *)
 
 val hang_ms : int
@@ -195,11 +216,12 @@ val hang_ms : int
     [CAP_SYS_ADMIN] and write access to the files they write, which root has:
     - {!detach} writes the function's [driver_override], its driver's [unbind],
       the [remove] file of each other function of its device if it removes them
-      ({!type-siblings}), and the function's [enable], [config] (its command
-      register) and [resourceN_resize] for its memory BAR, if it has one. Behind
-      an IOMMU that translates, it writes the [driver_override] and the driver's
-      [unbind] of each other function of the device in place of [remove], and
-      [/sys/bus/pci/drivers_probe];
+      ({!type-siblings}), with the [driver_override] and [vfio-pci]'s
+      [unbind] of each that [vfio-pci] holds, and the function's [enable],
+      [config] (its command register) and [resourceN_resize] for its memory
+      BAR, if it has one. Behind an IOMMU that translates, it writes the
+      [driver_override] and the driver's [unbind] of each other function of
+      the device in place of [remove], and [/sys/bus/pci/drivers_probe];
     - {!attach} writes [vfio-pci]'s [unbind], the function's [enable] and
       [driver_override], [/sys/bus/pci/rescan] and [/sys/bus/pci/drivers_probe],
       and, with [Remove], [vfio-pci]'s [unbind] and the [driver_override] of
@@ -264,7 +286,11 @@ val detach : t -> Machine.t -> int -> (progress, string) result
     every kernel driver off the function through probes, rescans and module
     loads until {!attach} or a reboot, and unbinds the kernel driver. It removes
     or keeps the other functions of the function's device, as [siblings] of
-    {!make} says.
+    {!make} says. With [Remove] ({!type-siblings}) and the function bound to
+    its kernel driver, it unbinds [vfio-pci] from each of them that
+    [vfio-pci] holds, as an {!attach} that stopped part-way may leave them,
+    after it sets the function's [driver_override] and before it unbinds the
+    kernel driver.
 
     Behind an IOMMU that translates the function's addresses, a process takes it
     through VFIO, which takes its IOMMU group whole. [detach] then sets the
@@ -320,22 +346,30 @@ val attach : t -> Machine.t -> int -> (unit, string) result
     has Linux rescan the bus and clears the override. With [Remove]
     ({!type-siblings}), each other function of the device on [vfio-pci], or
     whose [driver_override] names it, as {!detach} behind a translating IOMMU
-    leaves them, goes back to its driver the same way.
+    leaves them, is unbound from [vfio-pci] before the function's drivers are
+    probed, and goes back to its driver after. An [attach] that fails at that
+    probe leaves the function unbound and disabled, and each such other
+    function unbound with its [driver_override] naming [vfio-pci]. Loading
+    the kernel driver's module then binds the function, and the next [attach]
+    gives the others back.
 
-    [Error why] if no kernel driver takes the function or such another function,
-    such as when the kernel driver's module is not loaded. [Error why], with the
-    function left as it was but bound to [vfio-pci] where it was bound for the
-    reset, if [vfio-pci] or the reset fails, and [why] says how to proceed. An
-    exception raised by the driver's reset passes through, with the function
-    left the same way. *)
+    [Error why] if [vfio-pci] stays bound to such another function, or if no
+    kernel driver takes the function or such another function, such as when
+    the kernel driver's module is not loaded. [Error why], with the function
+    left as it was but bound to [vfio-pci] where it was bound for the reset,
+    if [vfio-pci] or the reset fails or [ready] ({!make}) refuses the
+    function, and [why] says how to proceed. An exception raised by the
+    driver's reset or by [ready] passes through, with the function left the
+    same way. *)
 
 val reset : t -> Machine.t -> int -> (unit, string) result
 (** [reset d m i] takes function [i] of [m], turns its bus mastering off, resets
-    it as its vendor does ({!make}) and releases it, whatever the driver's reset
-    returns or raises. After a reset that returns [Ok ()], the memory dead
-    processes left for the function goes ({{!Function.dma}system memory}), and
-    the next open does not renew the function. A reset that fails leaves the
-    function lost. An exception raised by the driver's reset passes through, as
-    in an open.
+    it as its vendor does ({!make}), asks [ready] of {!make} whether it is
+    ready, and releases it, whatever the driver's reset or [ready] returns or
+    raises. After a reset that returns [Ok ()], the memory dead processes left
+    for the function goes ({{!Function.dma}system memory}). A reset that fails
+    or a function [ready] refuses is lost; otherwise the next open does not
+    renew the function. An exception raised by the driver's reset or by
+    [ready] passes through, as in an open.
 
-    [Error why] with the driver's reset's reason. *)
+    [Error why] with the driver's reset's reason or [ready]'s. *)

@@ -85,7 +85,7 @@ val capability : t -> Rig_nv_abi.Gpu.t
       | [budget] | The path's {!field-budget}. |
       | [queues] | ["COMPUTE:0"] and ["COPY:0"] ({!section-submitting}). |
       | [copy_engine] | [Some 1], ["COPY:0"]. |
-      | [completion] | [Store]: the channels' releases write the word. |
+      | [completion] | [Store]: the channels' releases, or a submission's last launch, write the word. |
       | [waits] | [stores] and [hosts]. |
       | [may_block] | [false]: its C functions only store to memory. |
       | [hang_ms] | The path's {!field-hang_ms}. |
@@ -94,6 +94,7 @@ val capability : t -> Rig_nv_abi.Gpu.t
       | [alignment] | [4096]: each path allocates whole pages of 4 KiB. |
       | [capability] | {!val-capability} ({!Rig_nv_abi.declare}). |
       | [word] | The word [make] was given, mapped through the path. |
+      | [bus] | The path's {!field-bus}. |
     }
 
     The device maps the 64 KiB of rig's array of words that holds its word
@@ -124,7 +125,13 @@ val capability : t -> Rig_nv_abi.Gpu.t
 
     The device keeps device order and prefix order
     ({!Rig_edge.section-calls}), and the release of [v] waits for the work
-    of [v] to complete, so two submissions never overlap on the GPU. A part
+    of [v] to complete, so two submissions never overlap on the GPU. An
+    untimed submission whose parts all run on the compute channel and whose
+    last part is a launch, of a value whose low 32 bits are not [0], has
+    that launch release [v] as it completes, which follows every launch
+    before it. Such a [v] has the high 32 bits of [v - 1], so the word goes
+    from [v - 1] to [v] even if the launch writes the 64 bits in two stores,
+    which NVIDIA does not rule out. A part
     starts once the parts before it on its queue have completed, and reads
     what they wrote. [Words] run on their queue's
     channel. A copy runs on either channel and keeps its place in its
@@ -135,7 +142,10 @@ val capability : t -> Rig_nv_abi.Gpu.t
     each 2 GiB of each row. A fill writes its byte by the copy engine's
     remap of a constant, which reads no memory: in components of four bytes
     from the first multiple of 4 of its address, 2 GiB a launch, and of one
-    byte in the at most three bytes at each end.
+    byte in the at most three bytes at each end. On sm_80, sm_86, sm_87 and
+    sm_89, a copy or a fill of one row of at least 256 KiB within the
+    device's own [Device] memory runs instead as a kernel of the driver on
+    the compute channel.
 
     A wait names an aligned 64-bit word that the device's work addresses,
     and a value [w]. It holds the submission's work back until the word
@@ -271,8 +281,10 @@ val capability : t -> Rig_nv_abi.Gpu.t
     {!locate} returns the address of a region's first byte in the GPU's
     virtual address space ({!Rig_nv_abi.Gpu}). Its handle is the same
     address, and its host address is [None] for [Device] memory. Freeing a
-    region leaves the memory it maps, and other regions over that memory, in
-    place.
+    view ({!val-map_peer}) leaves the memory it maps and the other views in
+    place. A view must be freed before the region it maps, as rig does
+    ({!Rig_edge.Driver}): freeing that region first may give its memory or
+    its addresses out again while the view still reaches them.
 
     {!peer} is [true] iff paths of one [key] opened both devices and this
     device's path reaches the other GPU's memory ([reaches] of
@@ -281,7 +293,16 @@ val capability : t -> Rig_nv_abi.Gpu.t
     device's later work until the other device stops. {!val-map_peer} of a
     stopped device's [Mapped] memory is [None]. Peer access between GPUs is
     untested. {!val-map_host} returns [None] if the
-    path maps no host memory or refuses the pages ({!field-map_host}). *)
+    path maps no host memory or refuses the pages ({!field-map_host}).
+
+    {!val-dma} is the path's answer ({!field-dma}). Another function reads
+    what a value's work wrote once the value is reached: a copy's release
+    writes the word once the copy engine's earlier copies are complete
+    ({!Rig_nv_abi.Method.copy_release}), and a compute release once its
+    launches' writes are visible to the system. The device's later work
+    reads what the function wrote once its writes are complete: a copy
+    engine reads the memory itself, and each launch's descriptor invalidates
+    the compute engine's data caches as the launch starts. *)
 
 (** {1:images Images}
 
@@ -341,7 +362,7 @@ val capability : t -> Rig_nv_abi.Gpu.t
 
     Either way the stop frees the C state the device ran work with, its
     templates and the channels' records, which the channels never read. The
-    edge that reads the word, 24 bytes, stays for the process.
+    edge that reads the word, 80 bytes, stays for the process.
 
     Once the word shows the last value and {!val-stop} has returned, no work
     of the device writes it. A channel's release of a value follows its work,
@@ -405,9 +426,35 @@ type rm = {
   alloc : parent:int -> int -> params option -> (int, refusal) result;
       (** [alloc ~parent cls p] is a new object of class [cls] under [parent],
           made with the parameters [p], or the RM's refusal. *)
-  control : int -> int -> params option -> (unit, refusal) result;
-      (** [control obj cmd p] runs the command [cmd] on [obj], which reads and
-          writes [p] in place, or is the RM's refusal. *)
+  token : int -> (int, refusal) result;
+      (** [token ch] is the work submit token of the channel [ch], the word a
+          device stores at the path's {!field-doorbell} to wake it
+          ([NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN]), or the RM's
+          refusal. *)
+  schedule : int -> params -> (unit, refusal) result;
+      (** [schedule group p] schedules the channels of the channel group
+          [group] as [p], an [NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS] of
+          {!field-release}, says ([NVA06C_CTRL_CMD_GPFIFO_SCHEDULE]), or is the
+          RM's refusal. *)
+  boost : int -> (unit, refusal) result;
+      (** [boost subdevice] raises the clocks of the GPU of [subdevice] to
+          their maximum, at CUDA's high priority, with no end
+          ([NV2080_CTRL_CMD_PERF_BOOST] with the flags [_CMD_BOOST_TO_MAX],
+          [_CUDA_YES] and [_CUDA_PRIORITY_HIGH], for
+          [NV2080_CTRL_PERF_BOOST_DURATION_INFINITE]), or is the RM's
+          refusal. *)
+  sm_errors : int -> params -> (unit, refusal) result;
+      (** [sm_errors debugger p] reads into [p], an
+          [NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS], the errors of
+          the multiprocessors [p] asks for, through the debugger object
+          [debugger] ([NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES]), or is
+          the RM's refusal. *)
+  mmu_faults : int -> params -> (unit, refusal) result;
+      (** [mmu_faults debugger p] reads into [p], an
+          [NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS], the MMU's faults the
+          debugger object [debugger] recorded
+          ([NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO]), or is the RM's
+          refusal. *)
   free : (parent:int -> int -> (unit, refusal) result) option;
       (** [Some f] if the RM frees objects before it stops, where [f ~parent
           obj] frees [obj] and every object under it, or is the RM's refusal;
@@ -415,8 +462,10 @@ type rm = {
           keeps the channels a growth replaces until it stops
           ({!section-submitting}). *)
 }
-(** The type for a GPU's resource manager, as a path reaches it. Any domain may
-    call its functions at any time. *)
+(** The type for a GPU's resource manager, as a path reaches it: its
+    allocations, frees, and each command the driver sends, which the path
+    answers as NVIDIA's RM does. Any domain may call its functions at any
+    time. *)
 
 type gpu = {
   channel_class : int;  (** The class of its channels. *)
@@ -503,6 +552,12 @@ type 'm path = {
           for this GPU, or [None] if this GPU cannot address it. *)
   free : 'm memory -> unit;
       (** [free m] gives back what [alloc], [map_host] or [map_peer] gave. *)
+  bus : string option;
+      (** The bus address of the GPU's PCI function on its machine. *)
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
+      (** [dma m ~fn] is how the function at [fn] reaches the memory [m] that
+          [alloc] gave, as {!Rig_edge.Driver.val-dma} states, or [Error]
+          with the path's reason. *)
   register : int -> (unit, string) result;
       (** [register c] makes the channel [c], which the device allocated under
           [device], ready to run, as the path requires. *)

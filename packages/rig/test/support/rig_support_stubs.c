@@ -932,7 +932,9 @@ static int polled_room(void *self, int nwaits, const struct rig_part *parts,
                        int n, void *scratch, const uint8_t *args) {
   struct polled *p = self;
   struct polled_run *r = p->run;
-  atomic_store(&p->room_waits, nwaits);
+  /* Relaxed: the store sits in every submit the bench times, and a test
+     reads the count after its submit returned. */
+  atomic_store_explicit(&p->room_waits, nwaits, memory_order_relaxed);
   if (!scribble(scratch, n)) return RIG_NEVER;
   for (int i = 0; i < n; i++) {
     int kind = parts[i].kind;
@@ -1909,9 +1911,16 @@ value rig_test_host_held(value unit) {
    allocated: the count moved by what the cache held, with the order of the
    thread's last frees. Taking more chunks of each size than the cache holds,
    then freeing them, leaves the calling thread's cache full: it then adds the
-   same bytes to every count. */
+   same bytes to every count. A fill also moves chunks between glibc's lists
+   of free chunks, and the first after other work can leave the count short
+   of what the next leaves: by up to 1.6 KB after test_nv's device opens on
+   glibc 2.41, with no allocation between the two. The count is read once a
+   further fill leaves it as it was, which the second fill did there. */
 #define CACHED_SIZES 64
 #define CACHE_FILL 16
+/* Fills at most: another thread that allocates meanwhile could keep the
+   count moving, and the last is then read. */
+#define FILLS 8
 
 static void fill_cache(void) {
   /* Volatile, so that the compiler keeps each allocation and its free. */
@@ -1934,9 +1943,14 @@ value rig_test_heap_bytes(value unit) {
   malloc_zone_statistics(NULL, &s);
   return Val_long((intnat)s.size_in_use);
 #elif defined(__GLIBC__)
-  fill_cache();
-  struct mallinfo2 m = mallinfo2();
-  return Val_long((intnat)(m.uordblks + m.hblkhd));
+  size_t was = (size_t)-1, n = 0;
+  for (int i = 0; i < FILLS && n != was; i++) {
+    was = n;
+    fill_cache();
+    struct mallinfo2 m = mallinfo2();
+    n = m.uordblks + m.hblkhd;
+  }
+  return Val_long((intnat)n);
 #else
   return Val_long(-1);
 #endif

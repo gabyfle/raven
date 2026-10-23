@@ -103,6 +103,26 @@ val gpu : int -> Rig_amd.t Rig_edge.opener
     device reaches the memory of another GPU's device where the kernel
     driver's topology lists a link between the two GPUs.
 
+    {b Other functions.} {!Rig_amd.val-dma} exports the buffer object a
+    region lies in as a new dma-buf ({!Rig_edge.Dmabuf}), through KFD. The
+    dma-buf holds the object until its last reference goes, freed or not.
+    The kernel driver serves an importer the bus does not carry to the GPU's
+    BAR from host memory, and moves the object there for the GPU's own work
+    too, so the export of GPU memory is [Error] where Linux's p2pdma would
+    not carry [fn]'s requests to the GPU ({!Rig_pci.Machine.forwards}), and
+    also, for a process that cannot read the bridges' ACS controls, as one
+    without [CAP_SYS_ADMIN], wherever only a common bridge would carry them;
+    its reason names that cause. It
+    is [Error] too for an [fn] that names no PCI function of the machine,
+    and below KFD 1.12, Linux 6.4. The device's facts name the GPU's
+    function as [bus].
+
+    {b Sleeps.} From KFD 1.14, Linux 6.5, a release wakes every
+    {!Rig_amd.val-sleep} that waits for it. Before, a sleep that looked at
+    the word while another domain's sleep was waiting may miss the release's
+    interrupt, which that one takes, and wait out rig's still interval,
+    200 ms, before it looks again.
+
     {b Faults.} The kernel driver reports a fault of the GPU's work, a page
     fault or a hardware exception such as a reset, with its address or
     cause, and {!Rig_amd.val-sleep} raises it. The kernel driver bounds no
@@ -112,8 +132,11 @@ val gpu : int -> Rig_amd.t Rig_edge.opener
 
     {b Tracing.} The first thread trace takes the GPU's stable power state,
     which holds its clocks and shader engines steady, until the process
-    exits. The trace fails while another process holds that state. On a
-    GFX 9 GPU, traces take no power state. *)
+    exits. The trace fails while another process holds that state. A kernel
+    driver older than its fix of the state's handling may leave the state
+    held by a process that exited, which writing [auto] to the GPU's
+    [power_dpm_force_performance_level], as root, frees. On a GFX 9 GPU,
+    traces take no power state. *)
 
 (**/**)
 
@@ -127,6 +150,13 @@ val gpu : int -> Rig_amd.t Rig_edge.opener
 val buses_under : root:string -> (string list, string) result
 val count_under : root:string -> (int, string) result
 val gpu_under : root:string -> int -> Rig_amd.t Rig_edge.opener
+
+(* [event_age ()] is [true] iff this process's KFD, which it opens from
+   [/dev/kfd] as an open does, keeps the age of signal events (KFD 1.14), so
+   that no sleep misses a release's interrupt, as the module's sleeps
+   paragraph says. [false] if KFD cannot be opened. Raises [Invalid_argument]
+   from a callback inside a lock. *)
+val event_age : unit -> bool
 
 (* [gpu_at root bus] is the GPU at bus address [bus] as the [amdgpu] driver
    describes it under the directory [root]: its topology node and its blocks'

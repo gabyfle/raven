@@ -7,11 +7,16 @@
    up the protected region of memory (WPR2); SEC2 then runs the booter,
    which loads the GSP's firmware into it and starts the GSP's RISC-V core.
    On Blackwell the process asks the FSP, through its message queue, to boot
-   the GSP from the FMC (the chain of trust, COT). The GSP's requests of the
-   CPU ([Gsp]) are sequences of the same accesses. A heavy-secure ucode is
-   copied into a falcon from the GPU's memory, 256 bytes per DMA command,
-   and checked by the falcon's boot ROM against its signature. Addresses
-   come from NVIDIA's register headers. *)
+   the GSP from the FMC (the chain of trust, COT). A stop undoes the boot as
+   NVIDIA's RM does (kgspTeardown_TU102, kgspTeardown_GH100): on Ampere and
+   Ada FWSEC puts back the VBIOS's applications and the unloading booter takes
+   WPR2 down, which NVIDIA's driver requires to boot the GPU again; on
+   Blackwell the stop waits for the GSP's core to halt, which lets the FMC
+   finish the shutdown. The GSP's requests of the CPU ([Gsp]) are sequences
+   of the same accesses. A heavy-secure ucode is copied into a falcon from
+   the GPU's memory, 256 bytes per DMA command, and checked by the falcon's
+   boot ROM against its signature. Addresses come from NVIDIA's register
+   headers. *)
 
 open Field
 
@@ -30,6 +35,7 @@ type op =
   | Copy of int * int
   | Poll of string * int * int * cond
   | Delay of int
+  | Read of int
   | When of int * int * cond * op list
   | Expect of string * int * int * cond
 
@@ -59,6 +65,9 @@ let rec run c = function
       | Delay us ->
           Unix.sleepf (float us /. 1e6);
           continue ()
+      | Read r ->
+          ignore (Chip.get c r : int);
+          continue ()
       | Poll (what, r, mask, cond) -> (
           match
             Rig_pci.Function.wait c.fn ~us:(poll_ms * 1000) what (fun () ->
@@ -84,6 +93,26 @@ let hi32 x = (x lsr 32) land 0xffff_ffff
 let gsp = Defs.nv_pgsp
 let sec2 = Defs.nv_psec
 
+(* On Ampere and Ada the GPU's own boot unlocks its progress word, then reports
+   it complete: (register, mask, condition) each. *)
+let unlocked =
+  ( L.nv_pgc6_aon_secure_scratch_group_05_priv_level_mask,
+    mask
+      L
+      .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0,
+    Is
+      (put
+         L
+         .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0
+         Defs
+         .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0_enable)
+  )
+
+let completed =
+  ( L.nv_pgc6_aon_secure_scratch_group_05 0,
+    mask L.nv_pgc6_aon_secure_scratch_group_05_0_gfw_boot_progress,
+    Is Defs.nv_pgc6_aon_secure_scratch_group_05_0_gfw_boot_progress_completed )
+
 let wait_reset : Chip.family -> op list = function
   | Blackwell ->
       [
@@ -94,32 +123,20 @@ let wait_reset : Chip.family -> op list = function
             Is Defs.nv_therm_i2cs_scratch_fsp_boot_complete_status_success );
       ]
   | Ampere | Ada ->
+      let poll what (r, m, c) = Poll (what, r, m, c) in
       [
-        Poll
-          ( "the GPU's boot to unlock its progress",
-            L.nv_pgc6_aon_secure_scratch_group_05_priv_level_mask,
-            mask
-              L
-              .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0,
-            Is
-              (put
-                 L
-                 .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0
-                 Defs
-                 .nv_pgc6_aon_secure_scratch_group_05_priv_level_mask_read_protection_level0_enable)
-          );
-        Poll
-          ( "the GPU's boot",
-            L.nv_pgc6_aon_secure_scratch_group_05 0,
-            mask L.nv_pgc6_aon_secure_scratch_group_05_0_gfw_boot_progress,
-            Is
-              Defs
-              .nv_pgc6_aon_secure_scratch_group_05_0_gfw_boot_progress_completed
-          );
+        poll "the GPU's boot to unlock its progress" unlocked;
+        poll "the GPU's boot" completed;
       ]
 
-(* How long a falcon's reset is held. *)
-let reset_us = 100_000
+(* A falcon's reset as NVIDIA's RM makes it (kflcnPreResetWait_GA102,
+   kgspResetHw_TU102, ksec2ResetHw_TU102): a wait of at most 150 us for the
+   falcon to report itself ready, which the reset goes on without, then the
+   reset asserted and released, each followed by ten reads of the engine
+   register, which let the signal propagate, the first read also making the
+   write reach the GPU. *)
+let pre_reset_us = 150
+let propagation_reads = 10
 
 let reset base core =
   let engine =
@@ -128,10 +145,17 @@ let reset base core =
   let hwcfg2 = base + L.nv_pfalcon_falcon_hwcfg2 in
   let bcr = base + L.nv_priscv_riscv_bcr_ctrl in
   let reset x = Write (engine, put L.nv_pgsp_falcon_engine_reset x) in
+  let propagate = List.init propagation_reads (fun _ -> Read engine) in
   [
+    When
+      ( hwcfg2,
+        mask L.nv_pfalcon_falcon_hwcfg2_reset_ready,
+        Is 0,
+        [ Delay pre_reset_us ] );
     reset 1;
-    Delay reset_us;
-    reset 0;
+  ]
+  @ propagate @ [ reset 0 ] @ propagate
+  @ [
     Poll
       ( "the falcon's memories to be scrubbed",
         hwcfg2,
@@ -149,22 +173,32 @@ let reset base core =
             lor put L.nv_priscv_riscv_bcr_ctrl_brfetch 1 );
       ]
   | `Falcon ->
-      (* A falcon with a RISC-V core starts on it: select the falcon, and give
-         it the chip's identity. *)
+      (* A falcon with a RISC-V core starts on it: select the falcon, unless it
+         is selected already, which NVIDIA's RM skips
+         (kflcnSwitchToFalcon_GA102), and give it the chip's identity. A
+         selection made again after FWSEC ran never reported itself valid. *)
       [
         When
           ( hwcfg2,
             mask L.nv_pfalcon_falcon_hwcfg2_riscv,
             Not 0,
             [
-              Write (bcr, 0);
-              Poll
-                ( "the falcon core's selection",
-                  bcr,
-                  mask L.nv_priscv_riscv_bcr_ctrl_valid,
+              When
+                ( bcr,
+                  mask L.nv_priscv_riscv_bcr_ctrl_core_select,
                   Is
-                    (put L.nv_priscv_riscv_bcr_ctrl_valid
-                       Defs.nv_priscv_riscv_bcr_ctrl_valid_true) );
+                    (put L.nv_priscv_riscv_bcr_ctrl_core_select
+                       Defs.nv_priscv_riscv_bcr_ctrl_core_select_riscv),
+                  [
+                    Write (bcr, 0);
+                    Poll
+                      ( "the falcon core's selection",
+                        bcr,
+                        mask L.nv_priscv_riscv_bcr_ctrl_valid,
+                        Is
+                          (put L.nv_priscv_riscv_bcr_ctrl_valid
+                             Defs.nv_priscv_riscv_bcr_ctrl_valid_true) );
+                  ] );
               Copy (Defs.nv_pmc_boot_0, base + L.nv_pfalcon_falcon_rm);
             ] );
       ]
@@ -326,12 +360,82 @@ let legacy ~fwsec ~booter ~libos ~wpr_meta =
       Write (gsp + L.nv_pfalcon_falcon_os, 0);
       Expect
         ( "the GSP's core does not run",
-          gsp + L.nv_priscv_riscv_cpuctl,
-          mask L.nv_priscv_riscv_cpuctl_active_stat,
+          gsp + Defs.nv_priscv_riscv_cpuctl,
+          mask Defs.nv_priscv_riscv_cpuctl_active_stat,
           Is
-            (put L.nv_priscv_riscv_cpuctl_active_stat
+            (put Defs.nv_priscv_riscv_cpuctl_active_stat
                Defs.nv_priscv_riscv_cpuctl_active_stat_active) );
     ]
+
+(* Stops *)
+
+(* The GSP's firmware writes LIBOS_INTERRUPT_PROCESSOR_SUSPENDED to its
+   falcon's first mailbox once it has suspended at an unload. The wait
+   compares the whole word with it, as the RM of the firmware's release does
+   with a literal (_kgspIsProcessorSuspended, 570.144's kernel_gsp_tu102.c).
+   Later releases and nouveau test bit 31 alone, which the mailbox can pass
+   before the firmware writes it: the boot writes the low half of the libos
+   arguments' bus address there, and its bit 31 is set for about half of the
+   addresses. *)
+let processor_suspended = 0x8000_0000
+
+let suspended : Chip.family -> op list = function
+  | Ampere | Ada ->
+      [
+        Poll
+          ( "the GSP's firmware to suspend",
+            L.nv_pgsp_falcon_mailbox0,
+            all,
+            Is processor_suspended );
+      ]
+  | Blackwell ->
+      [
+        Poll
+          ( "the GSP's core to halt",
+            gsp + Defs.nv_priscv_riscv_cpuctl,
+            mask Defs.nv_priscv_riscv_cpuctl_halted,
+            Not 0 );
+      ]
+
+let fwsec_sb fwsec =
+  let expect what (r, m, c) = Expect (what, r, m, c) in
+  reset gsp `Falcon @ hs gsp fwsec
+  @ [
+      expect "FWSEC-SB left the GPU's boot progress locked" unlocked;
+      expect "FWSEC-SB left the GPU's boot incomplete" completed;
+      Expect
+        ( "FWSEC-SB failed",
+          L.nv_pbus_vbios_scratch Defs.nv_vbios_fwseclic_scratch_index_15,
+          mask Defs.nv_vbios_fwseclic_sb_err_code,
+          Is Defs.nv_vbios_fwseclic_sb_err_code_none );
+    ]
+
+(* The unloading booter's mailboxes for an unload that saves nothing for a
+   resumption: 0xff each (kgspExecuteBooterUnloadIfNeeded_TU102). *)
+let no_resume = 0xff lor (0xff lsl 32)
+
+let unload booter =
+  [
+    When
+      ( Defs.nv_pfb_pri_mmu_wpr2_addr_hi,
+        all,
+        Not 0,
+        reset sec2 `Falcon
+        @ hs sec2 ~mailbox:no_resume booter
+        @ [
+            Expect
+              ( "the unloading booter failed",
+                sec2 + L.nv_pfalcon_falcon_mailbox0,
+                all,
+                Is 0 );
+          ] );
+    Expect
+      ( "the GPU's protected memory (WPR2) is still up after the unloading \
+         booter",
+        Defs.nv_pfb_pri_mmu_wpr2_addr_hi,
+        all,
+        Is 0 );
+  ]
 
 (* Encodings *)
 

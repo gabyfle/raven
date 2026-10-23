@@ -274,6 +274,20 @@ let making () =
   let fixed = List.map (fun b -> (b, Rig.Read)) (Array.to_list (words t.d 4)) in
   (t, Array.init many part, fixed)
 
+(* A submission of 65,536 copies of 16 bytes, copy [k] from bytes [16 k] on of
+   one buffer into the same bytes of another, as a strided copy makes: making
+   it orders each part against the others on the copy engine. *)
+let copies = 65536
+
+let copying () =
+  let t = dev () in
+  let src = B.create t.d (16 * copies) and dst = B.create t.d (16 * copies) in
+  let part k =
+    let view b = B.view b ~first:(16 * k) ~length:16 in
+    Sub.(copy ~src:(Buffer (view src)) ~dst:(Buffer (view dst)))
+  in
+  (t, Array.init copies part)
+
 let submit_rows =
   let row name setup f = Thumper.bench_with_setup ~setup name f in
   Thumper.group "submit/polled"
@@ -302,6 +316,8 @@ let submit_rows =
           waited w);
       row "make-4096" making (fun (t, parts, fixed) ->
           ignore (Sub.make ~fixed t.d parts));
+      row "make-copies-64K" copying (fun (t, parts) ->
+          ignore (Sub.make t.d parts));
       row "launch-refs-8" launching (fun (t, run, b, buffers) ->
           take run;
           for k = 0 to refs - 1 do
@@ -390,18 +406,35 @@ let replay_rows =
 let kib = 1024
 let mib = 1024 * kib
 
-(* A copy of 64 MiB times at one of three levels 5% apart on an i9-9900K, set by
-   where its two buffers lie physically, apart for each row of a process: the
-   memcpy floor, which runs no rig code, shows them too. The budget admits all
-   three; the 4 KiB rows time the same paths at the default 5%. *)
-let copy_64M = [ Thumper.Budget.no_slower_than 0.15 ]
+(* The bytes of a large copy or blit: the host's copy releases the runtime
+   from 64 KiB, as for any larger one, and its two buffers fit the
+   last-level cache with room. A copy past that cache is bound by the
+   memory bus every process on the host shares, and lands on levels up to
+   30% apart from one run to the next. *)
+let large_bytes = 4 * mib
 
 let memory () =
   incr opened;
   Result.get_ok (Rig.memory_device (strf "memory:%d" !opened))
 
 let host n = B.create Rig.host n
+
+(* [n] bytes of host memory, written. Pages never written all map one page
+   of zeros, from which a copy of 64 KiB reads about ten times slower than
+   from written memory on fudge, and whether an allocation gets such pages
+   depends on what the heap held before. *)
+let host_written n =
+  let b = host n in
+  B.fill b 'w';
+  b
+
 let chars n = Bigarray.Array1.create Bigarray.char Bigarray.c_layout n
+
+(* [n] bytes of a bigarray, written, as [host_written] writes its memory. *)
+let written_chars n =
+  let a = chars n in
+  Bigarray.Array1.fill a 'w';
+  a
 
 (* Buffers of [d] whose last write, a submission of [d], is reached. *)
 let written d n =
@@ -450,10 +483,9 @@ let buffer_rows =
       row "blit-from-string-4K"
         (fun () -> (String.make (4 * kib) 's', host (4 * kib)))
         (fun (s, b) -> B.blit_from_string s 0 b 0 (4 * kib));
-      Thumper.bench_with_setup ~budgets:copy_64M
-        ~setup:(fun () -> (host (64 * mib), Bytes.create (64 * mib)))
-        "blit-to-bytes-64M"
-        (fun (b, s) -> B.blit_to_bytes b 0 s 0 (64 * mib));
+      row "blit-to-bytes-4M"
+        (fun () -> (host_written large_bytes, Bytes.create large_bytes))
+        (fun (b, s) -> B.blit_to_bytes b 0 s 0 large_bytes);
     ]
 
 let claim_rows =
@@ -514,13 +546,13 @@ let copy_rows =
   Thumper.group "copy"
     [
       row "host-4K" (pair Rig.host (4 * kib)) copy;
-      Thumper.bench_with_setup ~budgets:copy_64M
-        ~setup:(pair Rig.host (64 * mib))
-        "host-64M" copy;
+      row "host-4M"
+        (fun () -> (host_written large_bytes, host large_bytes))
+        copy;
       row "memory-4K" (fun () -> pair (memory ()) (4 * kib) ()) copy;
       row "queue-64K"
         (fun () ->
-          (B.create Rig.host (64 * kib), B.create (unaddressed ()) (64 * kib)))
+          (host_written (64 * kib), B.create (unaddressed ()) (64 * kib)))
         copy;
       (* Another domain copying on the same device until the row ends: both
          submit the device's one copier run at once. *)
@@ -530,13 +562,13 @@ let copy_rows =
           let stop = Atomic.make false in
           let rival =
             Domain.spawn (fun () ->
-                let src = B.create Rig.host (64 * kib)
+                let src = host_written (64 * kib)
                 and dst = B.create d (64 * kib) in
                 while not (Atomic.get stop) do
                   B.copy ~src ~dst
                 done)
           in
-          ((B.create Rig.host (64 * kib), B.create d (64 * kib)), stop, rival))
+          ((host_written (64 * kib), B.create d (64 * kib)), stop, rival))
         ~teardown:(fun (_, stop, rival) ->
           Atomic.set stop true;
           Domain.join rival)
@@ -544,6 +576,20 @@ let copy_rows =
         (fun (ends, _, _) -> copy ends);
       row "staged-4K" (staged ~closed:0 (4 * kib)) copy;
       row "staged-4K/after-1024-closed" (staged ~closed:1024 (4 * kib)) copy;
+      (* Eight small copies from the host through its staging memory to one
+         device, queued one after the other and waited for once: the host
+         writes each piece without waiting for the device. *)
+      row "queued/host-to-device-8x4K"
+        (fun () ->
+          let d = unaddressed () in
+          Array.init 8 (fun _ -> (B.create Rig.host (4 * kib), B.create d (4 * kib))))
+        (fun ends ->
+          let last = ref None in
+          Array.iter
+            (fun (src, dst) ->
+              last := Some (B.submit_copy ~src ~dst [| B.row (4 * kib) |]))
+            ends;
+          Option.iter Rig.Point.wait !last);
     ]
 
 (* A collection hands the memory of 1,000 dropped buffers back, and the next
@@ -738,9 +784,9 @@ let memory_floor_rows =
         ignore (Atomic.compare_and_set a 0 1);
         ignore (Atomic.compare_and_set a 1 0));
     row "memcpy-4K" (chars2 (4 * kib)) blit;
-    Thumper.bench_with_setup ~budgets:copy_64M
-      ~setup:(chars2 (64 * mib))
-      "memcpy-64M" blit;
+    row "memcpy-4M"
+      (fun () -> (written_chars large_bytes, chars large_bytes))
+      blit;
     Thumper.bench "bigarray-dropped-1000" (fun () ->
         for _ = 1 to dropped do
           ignore (chars (4 * kib))

@@ -31,10 +31,14 @@
 
     {!detach} takes the GPU from its kernel driver, and {!attach} gives it
     back. An open holds the GPU until its device is stopped, and no other
-    open, in this process or another, can take it meanwhile. A GPU the
-    process held keeps its GSP running after that, and its next open or
-    {!attach} resets it first, as {!reset} does. A GPU whose reset has
-    failed is lost, and its next open resets it again.
+    open, in this process or another, can take it meanwhile. A stop
+    unloads the GSP's firmware and, on Ampere and Ada, takes down the
+    protected memory (WPR2) the boot set up, which NVIDIA's driver refuses
+    to boot a GPU with. {!attach} resets a GPU first, as {!reset} does. A
+    GPU whose stop could not unload its GSP's firmware or take its boot
+    down, or whose reset has failed, is lost, and its next open resets it
+    first. A reset that leaves WPR2 up fails, so neither an open nor
+    {!attach} hands such a GPU on.
 
     {!Rig_pci.section-needs} states what any open of a GPU with no kernel
     driver needs. *)
@@ -64,10 +68,14 @@
     ({!Rig_pci.Function.alloc_dma}). The GPUs' addresses and the process's
     addresses of system memory coincide, from 64 GiB to {!Rig_nv.windows},
     which the process reserves at its first open; every GPU it opens takes
-    its addresses from that range.
+    its addresses from that range. A device's stop gives back every address
+    its open took, once the GPU's memory regions are freed, unless the GPU
+    stopped answering ({!Rig_nv.val-stop}), which keeps the addresses the
+    GPU may still reach.
     - Behind an IOMMU, system memory counts against the process's limit on
       locked memory ([RLIMIT_MEMLOCK]), and {!Rig_nv.val-alloc} returns
-      [None] once it is reached. Raise the limit to allocate more.
+      [None] once it is reached. Raise the limit to allocate more. Such a
+      GPU's device has [maps_host] [true].
     - Taken physically, system memory lies in huge pages of 2 MiB, and
       {!Rig_nv.val-alloc} returns [None] once none is free. Reserve more
       huge pages ([vm.nr_hugepages]) or free memory. Such a GPU's device has
@@ -83,8 +91,8 @@
     asks ([Rig_nv.rm]'s [free] is [Some]), so a device of this path gives
     back the channels a growth replaces as {!Rig_nv.section-submitting}
     states. With each set goes the GPU memory the path gave the GSP for it:
-    the instance blocks and method buffers of its two channels and the
-    compute engine's context buffers. *)
+    the instance blocks of its two channels, the method buffer of their
+    group and the compute engine's context buffers. *)
 
 (** {1:gpus GPUs}
 
@@ -107,13 +115,15 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
 
 (** {1:firmware Firmware}
 
-    A boot loads three files of linux-firmware's [nvidia/] directory at
-    commit [0a6871b1], each pinned by its BLAKE2b-256 digest: the GSP's
-    firmware [nvidia/ga102/gsp/gsp-570.144.bin], the same for every family,
-    then its bootloader and the image that starts it:
-    - Ampere: [ga102/gsp/bootloader-570.144.bin] and
-      [ga102/gsp/booter_load-570.144.bin];
-    - Ada: the same two under [ad102];
+    A boot loads files of linux-firmware's [nvidia/] directory at commit
+    [0a6871b1], each pinned by its BLAKE2b-256 digest: the GSP's firmware
+    [nvidia/ga102/gsp/gsp-570.144.bin], the same for every family, then its
+    bootloader, the image that starts it, and on Ampere and Ada the booter
+    that takes the boot down at its stop:
+    - Ampere: [ga102/gsp/bootloader-570.144.bin],
+      [ga102/gsp/booter_load-570.144.bin] and
+      [ga102/gsp/booter_unload-570.144.bin];
+    - Ada: the same three under [ad102];
     - Blackwell: [gb202/gsp/bootloader-570.144.bin] and
       [gb202/gsp/fmc-570.144.bin].
 
@@ -141,6 +151,14 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
     Two GPUs map each other's memory only if both are taken physically, on
     one machine, each BAR reaches all of its GPU's memory, and the bus carries
     requests between them ({!Rig_pci.Memory.reaches}).
+
+    {!Rig_nv.val-dma} gives another function, such as a NIC that a process
+    drives over PCI, a region's bus ranges ({!Rig_edge.Bus}), or the reason
+    it cannot reach them, as {!Rig_pci.Memory.bus} states: GPU memory
+    through BAR 1, the memory BAR. The region's memory and the GPU then stay
+    the process's until it exits, so no later open of the GPU, in this
+    process or another, succeeds meanwhile. The device's facts name the
+    GPU's function as [bus].
 
     A device reads the GPU's timer registers through BAR 0
     ({!Rig_nv.Registers}), so its profiles' times drift from the host's
@@ -179,7 +197,7 @@ val gpu :
       what it lacks;
     - an image is missing, naming the directories and the files found with
       another digest, or one found is not laid out as its format says;
-    - its GSP still runs after its reset;
+    - its protected memory (WPR2) is still up after its reset;
     - the machine refuses the addresses or the GSP's memory.
 
     A GPU reset first stays reset. Once the GSP's memory is taken, a
@@ -220,7 +238,8 @@ val attach : int -> (unit, string) result
     ({!Rig_pci.Driver.attach}).
 
     [Error why] if there is no GPU [i], if this process holds it, or as
-    {!Rig_pci.Driver.attach}.
+    {!Rig_pci.Driver.attach}, a reset that leaves the GPU's protected memory
+    (WPR2) up among its failed resets.
 
     Raises [Invalid_argument] if [i < 0]. *)
 
@@ -231,12 +250,18 @@ val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
     function ({!Rig_pci.Function.reset}).
 
     [Error why] if there is no GPU [i], if this process holds it, if its
-    function cannot be taken, or if Linux has no reset for it or it does not
-    respond after one.
+    function cannot be taken, if Linux has no reset for it or it does not
+    respond after one, or if its protected memory (WPR2) is still up after
+    it.
 
     Raises [Invalid_argument] if [i < 0]. *)
 
 (**/**)
+
+val taken : unit -> int
+(* [taken ()] is the number of ranges of the GPUs' addresses that this
+   library's opens hold, for the suites that check that a stop gives back
+   every range its open took. *)
 
 (* Boot reports, for the suites that check, without a GPU, what an open
    loads to boot a GPU and whether it refuses the GPU for its chip, its VBIOS
@@ -259,7 +284,8 @@ type image = {
 type report = {
   chip : string;  (** The chip's name, such as ["AD102"]. *)
   images : image list;
-      (** The GSP's firmware, its bootloader, then the booter or the FMC. *)
+      (** The GSP's firmware, its bootloader, then the booter or the FMC,
+          then on Ampere and Ada the unloading booter. *)
 }
 (** The type for boot reports. *)
 
@@ -299,6 +325,7 @@ module Falcon : sig
     | Copy of int * int
     | Poll of string * int * int * cond
     | Delay of int
+    | Read of int
     | When of int * int * cond * op list
     | Expect of string * int * int * cond
 

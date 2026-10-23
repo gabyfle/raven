@@ -26,6 +26,9 @@ type op =
       (** [Poll (what, r, mask, c)] waits for [r]'s bits [mask] to meet [c], for
           at most 30 seconds; [what] names what is waited for. *)
   | Delay of int  (** [Delay us] waits [us] microseconds. *)
+  | Read of int
+      (** [Read r] reads [r], which also makes the writes before it reach the
+          GPU. *)
   | When of int * int * cond * op list
       (** [When (r, mask, c, ops)] runs [ops] if [r]'s bits [mask] meet [c]. *)
   | Expect of string * int * int * cond
@@ -50,8 +53,8 @@ val wait_reset : Chip.family -> op list
     FSP [FSP_BOOT_COMPLETE_STATUS_SUCCESS] (Blackwell). *)
 
 val reset : int -> [ `Falcon | `Riscv ] -> op list
-(** [reset base core] resets the falcon at [base] (Ampere and Ada), holding the
-    reset 100 ms, waits for it to scrub its memories, and selects [core]. *)
+(** [reset base core] resets the falcon at [base] (Ampere and Ada) as NVIDIA's
+    RM does, waits for it to scrub its memories, and selects [core]. *)
 
 val start : int -> op list
 (** [start base] starts the falcon's CPU at its boot vector, through its alias
@@ -103,3 +106,21 @@ val cot_payload : args:int -> fmc:int -> Images.fmc -> string
 val cot : string -> op list
 (** [cot payload] sends the FSP the COT [payload] and waits for the GSP's boot
     to release its lockdown (Blackwell). *)
+
+(** {1:stops Stops} *)
+
+val suspended : Chip.family -> op list
+(** [suspended f] waits for the GSP's firmware to suspend after its unload:
+    its libos reports it in the GSP's first mailbox (Ampere, Ada), or its
+    core halts once the FMC has finished the shutdown (Blackwell). *)
+
+val fwsec_sb : hs -> op list
+(** [fwsec_sb fwsec] runs FWSEC with its SB command ({!Vbios.Sb}) on the
+    GSP's reset falcon, which puts back the VBIOS's applications, then checks
+    that the GPU's own boot status is unlocked and complete, and that FWSEC's
+    error code is zero (Ampere, Ada). *)
+
+val unload : hs -> op list
+(** [unload booter] takes the GPU's protected memory (WPR2) down, if it is
+    up, with the unloading booter on SEC2, and checks the booter's mailbox and
+    that WPR2 is down (Ampere, Ada). *)

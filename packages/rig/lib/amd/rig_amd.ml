@@ -124,6 +124,8 @@ type 'm path = {
   reaches : int -> bool;
   map_peer : 'm memory -> 'm memory option;
   free : 'm memory -> unit;
+  bus : string option;
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
   queue :
     [ `Pm4 | `Aql | `Sdma ] ->
     ring:int ->
@@ -136,7 +138,8 @@ type 'm path = {
   hdp : int option;
   interrupt : int;
   hang_ms : int option;
-  sleep : ms:int -> unit;
+  interrupts : unit -> int;
+  sleep : ms:int -> after:int -> unit;
   stable_power : unit -> (unit, string) result;
   stop : fault:string option -> [ `Stopped | `Unknown ];
 }
@@ -157,6 +160,7 @@ type ops = {
   alloc : Rig_edge.memory -> int -> mem option;
   map_host : (int -> int -> mem option) option;
   map_peer : mem -> mem option;
+  dma : mem -> fn:string -> (Rig_edge.dma, string) result;
   queue :
     [ `Pm4 | `Aql | `Sdma ] ->
     ring:int ->
@@ -166,7 +170,8 @@ type ops = {
     (int, refusal) result;
   retire : int -> unit;
   most_ring : [ `Pm4 | `Aql | `Sdma ] -> int;
-  sleep : ms:int -> unit;
+  interrupts : unit -> int;
+  sleep : ms:int -> after:int -> unit;
   stable_power : unit -> (unit, string) result;
   stop : fault:string option -> [ `Stopped | `Unknown ];
 }
@@ -184,9 +189,15 @@ let ops (type m) (p : m path) =
     map_host = Option.map (fun f a n -> Option.map pack (f a n)) p.map_host;
     map_peer =
       (fun m -> Option.bind (own m) (fun m -> Option.map pack (p.map_peer m)));
+    dma =
+      (fun m ~fn ->
+        match own m with
+        | Some m -> p.dma m ~fn
+        | None -> invalid_arg "Rig_amd.dma: another path's memory");
     queue = p.queue;
     retire = p.retire;
     most_ring = p.most_ring;
+    interrupts = p.interrupts;
     sleep = p.sleep;
     stable_power = p.stable_power;
     stop = p.stop;
@@ -338,6 +349,7 @@ type t = {
   maps_host : bool;
   word : region; (* rig frees a word of the device's own after stop *)
   reaches : int -> bool; (* the path's *)
+  bus : string option; (* the path's *)
   capability : Abi.Capability.t;
   guard : Lock.t;
       (* held by [grow_scratch], [make_trace], and stop over [live] *)
@@ -350,14 +362,17 @@ type t = {
    comparing all 64 bits of a word the host moved across 2^32. GC 12.0.1: the
    R9700, MEC firmware 3010. *)
 let wait64_from = [ ((12, 0, 1), 3010) ]
-let ring_bytes = 16 lsl 20
+(* The bytes of the first compute ring, copy ring and argument segment of a
+   device made from now on ([set_first_sizes]). *)
+let first_sizes = Atomic.make (16 lsl 20, 16 lsl 20, 2 lsl 20)
 
-(* The bytes of [p]'s first ring of a queue of kind [k]. *)
-let first_ring (p : _ path) k = Int.min ring_bytes (p.most_ring k)
+(* The bytes of [p]'s first ring of a queue of kind [k], of [compute] or
+   [copy] bytes where [p] makes rings that large. *)
+let first_ring (p : _ path) ~compute ~copy k =
+  Int.min (if k = `Sdma then copy else compute) (p.most_ring k)
 
 (* A path's refusal, as an open's error. *)
 let why = function Lacking why | Full why | Refused why -> why
-let segment_bytes = 2 lsl 20
 let pointers_bytes = 4096
 
 (* The stamp ring: RIG_AMD_STAMPS slots of four 8-byte words, then the record
@@ -704,6 +719,7 @@ let facts g =
     alignment = region_alignment;
     capability = Abi.declare g.capability;
     word = g.word;
+    bus = g.bus;
     edge = Nativeint.of_int g.self;
   }
 
@@ -770,6 +786,33 @@ let map_peer g _ r =
           free_mem m;
           None
       | None -> view None)
+
+(* Another function's writes through the memory BAR pass the host data path
+   (HDP) as the host's do, so every hand-over flushes it once a region is
+   given: the region counts for the process's life, as the function may write
+   it until then. Its reads through the BAR may hit the HDP's read cache, which
+   the kernel invalidates before its own reads (amdgpu_device.c,
+   amdgpu_device_aper_access) on HDP 4.0 to 4.2, 5.0 and 5.2.0 alone:
+   hdp_v4_0.c's invalidate_hdp returns at once on 4.4.0, 4.4.2 and 4.4.5, and
+   hdp_v5_2.c, hdp_v6_0.c and hdp_v7_0.c have none (amdgpu_discovery.c pairs
+   each version with its file). The GPUs this driver drives report HDP 4.4.2
+   (gfx942), 4.4.5 (gfx950), 6 (GFX 11) and 7 (GFX 12) in their discovery
+   tables, so their releases need no invalidation: a value's release writes
+   the L2 back, and the function reads what the work wrote once the value is
+   reached. *)
+let dma g r ~fn =
+  match g.hdp with
+  | None ->
+      Error
+        "the host reaches no register that flushes the GPU's host data path, \
+         through which another function's writes reach the GPU's memory"
+  | Some _ ->
+      if not (count_hdp g g.self 1) then
+        Error "the device stopped, or flushes no more host data paths"
+      else
+        let answer = (live g).ops.dma r.mem ~fn in
+        if Result.is_error answer then ignore (count_hdp g g.self (-1));
+        answer
 
 let map_host g a n =
   if n < 1 then invalid_argf "Rig_amd.map_host: %d bytes, expected at least 1" n;
@@ -1106,10 +1149,12 @@ let make (type m) ~word (p : m path) =
           copy_word host word;
           Ok own
     in
+    let compute, copy, segment_bytes = Atomic.get first_sizes in
+    let first_ring = first_ring p ~compute ~copy in
     let* segment = alloc "argument segment" segment_bytes in
     let compute_kind = if aql then `Aql else `Pm4 in
-    let* compute = alloc "compute ring" (first_ring p compute_kind) in
-    let* copy = alloc "copy ring" (first_ring p `Sdma) in
+    let* compute = alloc "compute ring" (first_ring compute_kind) in
+    let* copy = alloc "copy ring" (first_ring `Sdma) in
     let* pointers = alloc "queue positions" pointers_bytes in
     let* stamps = alloc "stamp ring" stamps_bytes in
     let* stamps_host = host_of "stamp ring" stamps in
@@ -1147,7 +1192,7 @@ let make (type m) ~word (p : m path) =
       let at = mem_address pointers in
       let* doorbell =
         Result.map_error why
-          (p.queue kind ~ring:(mem_address ring) ~bytes:(first_ring p kind)
+          (p.queue kind ~ring:(mem_address ring) ~bytes:(first_ring kind)
              ~read:(at + read_at ~aql q)
              ~write:(at + write_at ~aql q))
       in
@@ -1168,7 +1213,7 @@ let make (type m) ~word (p : m path) =
     set_templates self p.gpu ~interrupt:p.interrupt ~waits64 ~aql;
     set_copy_launch self !copy_launch;
     let ring q kind host bell id =
-      set_ring self q host (first_ring p kind) (p.most_ring kind)
+      set_ring self q host (first_ring kind) (p.most_ring kind)
         (pointers_host + write_at ~aql q)
         bell (ring_kind kind) id
     in
@@ -1200,6 +1245,7 @@ let make (type m) ~word (p : m path) =
         maps_host = Option.is_some ops.map_host;
         word = region 8 word;
         reaches = p.reaches;
+        bus = p.bus;
         capability =
           {
             gpu = p.gpu;
@@ -1268,8 +1314,21 @@ external raise_word : int -> unit = "caml_rig_amd_raise"
 
 let signaled g = signaled_word g.self
 
+(* What each sleep calls between its read of the word and the path's sleep,
+   for the suites. *)
+let before_sleep = Atomic.make ignore
+let hold_sleeps f = Atomic.set before_sleep f
+
+(* The path's count is read before the word, as an eventcount's: a release
+   that moves the word after this read raises an interrupt, which either waits
+   for the path's sleep or moves the count, as another domain's sleep took
+   it. *)
 let sleep g ~seen ~still_ms =
-  if signaled g = seen then (live g).ops.sleep ~ms:still_ms
+  let after = match g.live with Some l -> l.ops.interrupts () | None -> 0 in
+  if signaled g = seen then begin
+    (Atomic.get before_sleep) ();
+    (live g).ops.sleep ~ms:still_ms ~after
+  end
 
 (* Growth
 
@@ -1538,3 +1597,20 @@ let ring g q =
       refuse_stopped g "ring";
       placed g.self i
   | None -> invalid_argf "Rig_amd.ring: no queue %S" q
+
+external segment_bytes : int -> int = "caml_rig_amd_segment_bytes"
+
+let segment g =
+  Lock.check "Rig_amd.segment";
+  Lock.protect g.guard @@ fun () ->
+  refuse_stopped g "segment";
+  segment_bytes g.self
+
+let set_first_sizes ~compute ~copy ~segment =
+  let sized n = n >= 4096 && n land (n - 1) = 0 in
+  if not (sized compute && sized copy && sized segment) then
+    invalid_argf
+      "Rig_amd.set_first_sizes: %d, %d and %d bytes, expected powers of two \
+       of at least 4096"
+      compute copy segment;
+  Atomic.exchange first_sizes (compute, copy, segment)

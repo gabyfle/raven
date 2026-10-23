@@ -102,6 +102,10 @@ external kfd_alloc : int -> int -> int -> int -> memory -> int * int64
 
 external kfd_free : int -> int -> unit = "caml_rig_amd_amdgpu_free"
 
+(* [kfd_export kfd handle] is a new dma-buf descriptor over [handle],
+   close-on-exec. *)
+external kfd_export : int -> int -> int = "caml_rig_amd_amdgpu_export"
+
 (* [kfd_map_gpu kfd handle gpu map] maps [handle] for GPU [gpu], or unmaps it
    if [map] is [false]: the GPUs it reached. *)
 external kfd_map_gpu : int -> int -> int -> bool -> int
@@ -142,6 +146,14 @@ external kfd_destroy_queue : int -> int -> unit
    fault set, which would end every later wait at once. *)
 external kfd_wait : int -> int array -> int -> int -> fault option
   = "caml_rig_amd_amdgpu_wait"
+
+(* [kfd_sleep kfd ids ms me after] waits at most [ms] for the signal event
+   [ids.(0)] or the exception events after it, as [kfd_wait] does, with
+   [after] as the signal's last age. It is the signal's age once it woke the
+   wait, [after] if it did not, or -1 for a fault of GPU [me], which
+   [kfd_wait] then reads. It allocates nothing. *)
+external kfd_sleep : int -> int array -> int -> int -> int -> int
+  = "caml_rig_amd_amdgpu_sleep"
 
 (* The render node *)
 
@@ -189,6 +201,10 @@ let opened path what =
 
 type gpu = {
   node : Topology.node;
+  root : string; (* its machine's files *)
+  bus : string;
+  machine : Rig_pci.Machine.t; (* its machine's files, at the path's root *)
+  version : int; (* KFD's, major * 1000 + minor *)
   drm : int; (* its render node *)
   hdp : int option; (* the register whose store flushes the HDP *)
   clock_khz : int;
@@ -275,6 +291,7 @@ type mem = {
   at : int; (* the process's addresses, unmapped at the free *)
   kind : kind;
   owner : gpu; (* the GPU it was allocated for *)
+  vram : bool; (* whether it is the GPU's memory *)
 }
 
 (* Maps or unmaps [handle] for GPU [gpu]. Raises [Unix.Unix_error], [EIO] if
@@ -345,7 +362,16 @@ let alloc fd g (kind : Rig_edge.memory) n : mem Amd.memory option =
          with Unix.Unix_error (e, _, _) ->
            undo fd handle at n "mapping memory for the GPU" e);
         let host = if kind = Device then None else Some at in
-        let data = { handle; bytes = n; at; kind = Own; owner = g } in
+        let data =
+          {
+            handle;
+            bytes = n;
+            at;
+            kind = Own;
+            owner = g;
+            vram = kind <> Pinned;
+          }
+        in
         Some { Amd.address = at; host; data }
 
 (* The kernel driver lets go of memory before the process unmaps it: unmapping
@@ -382,7 +408,14 @@ let map_host fd g a n : mem Amd.memory option =
   in
   let region (e : registration) =
     let data =
-      { handle = e.handle; bytes; at = start; kind = Borrowed e; owner = g }
+      {
+        handle = e.handle;
+        bytes;
+        at = start;
+        kind = Borrowed e;
+        owner = g;
+        vram = false;
+      }
     in
     Some { Amd.address = a; host = Some a; data }
   in
@@ -418,6 +451,74 @@ let map_peer fd g (m : mem Amd.memory) =
     (* Made before the view counts, so that nothing allocates after. *)
     let view = Some { m with data = { m.data with kind = Peer } } in
     if take_view fd m.data.handle g.node.gpu_id then view else None
+
+(* Another function's DMA
+
+   KFD exports a buffer object of the process as a dma-buf, KFD 1.12 on
+   (kfd_chardev.c, kfd_ioctl_export_dmabuf), with the descriptor flags the
+   caller gives. amdgpu decides at each attach whether the importer reaches
+   the GPU's memory by peer-to-peer DMA (amdgpu_dma_buf.c,
+   amdgpu_dma_buf_attach): it does not where neither an XGMI link nor
+   Linux's p2pdma carries the importer's requests to the GPU's BAR, and then
+   pins the object into system memory, under the GPU's own work too
+   (amdgpu_dma_buf_pin). So GPU memory goes only to a function the bus
+   carries, by p2pdma's rule, which Rig_pci.Machine.forwards states; a NIC
+   has no XGMI link. The attach's other two refusals cannot arise: rig makes
+   no GFX12 object with compressed metadata (AMDGPU_GEM_CREATE_GFX12_DCC),
+   and the process's open KFD file keeps the GPU runtime-active. *)
+
+let export_from = 1012
+
+let known g fn =
+  match Rig_pci.Machine.functions g.machine with
+  | Error why -> Error why
+  | Ok ids when List.exists (fun (id : Rig_pci.Machine.id) -> id.bus = fn) ids
+    ->
+      Ok ()
+  | Ok _ -> Error (strf "%S names no PCI function of the machine" fn)
+
+(* Whether the process reads the GPU's whole configuration space, where the
+   bridges' ACS controls lie, as Machine.forwards needs to tell a route
+   below a common bridge. *)
+let reads_acs g =
+  match
+    In_channel.with_open_bin
+      (Filename.concat g.root ("sys/bus/pci/devices/" ^ g.bus ^ "/config"))
+      In_channel.input_all
+  with
+  | c -> String.length c > 64
+  | exception Sys_error _ -> false
+
+let unrouted g fn =
+  if reads_acs g then
+    strf
+      "the bus does not carry %s's requests to %s's memory BAR, as Linux's \
+       p2pdma decides, and amdgpu would serve them from system memory"
+      fn g.bus
+  else
+    strf
+      "this process cannot read the bridges' ACS controls, which needs \
+       CAP_SYS_ADMIN, so it cannot tell whether the bus carries %s's \
+       requests to %s's memory BAR, which amdgpu would otherwise serve from \
+       system memory"
+      fn g.bus
+
+let dma fd g (m : mem Amd.memory) ~fn =
+  let p = m.data in
+  if p.kind <> Own then
+    invalid_arg "Rig_amd_amdgpu.dma: memory alloc did not give";
+  let* () = known g fn in
+  if g.version < export_from then
+    Error "KFD exports no dma-buf before its version 1.12, in Linux 6.4"
+  else if
+    p.vram
+    && not (Rig_pci.Machine.forwards g.machine ~provider:g.bus ~client:fn)
+  then Error (unrouted g fn)
+  else
+    match kfd_export fd p.handle with
+    | dmabuf -> Ok (Rig_edge.Dmabuf { fd = dmabuf; offset = m.address - p.at })
+    | exception Unix.Unix_error (e, _, _) ->
+        Error (strf "exporting GPU memory as a dma-buf: %s" (message e))
 
 (* Opening a GPU *)
 
@@ -501,7 +602,7 @@ let topology root =
   Ok (nodes m)
 
 (* [gpus] is the machine's topology, as [topology] gave it. *)
-let acquire fd ~root ~gpus (node : Topology.node) =
+let acquire fd ~root ~gpus ~bus (node : Topology.node) =
   match Ids.find_opt node.gpu_id !acquired with
   | Some g -> Ok g
   | None ->
@@ -534,9 +635,16 @@ let acquire fd ~root ~gpus (node : Topology.node) =
               Some n.index
           | _ -> None)
       in
+      let machine =
+        if root = "/" then Rig_pci.Machine.this else Rig_pci.Machine.at root
+      in
       let g =
         {
           node;
+          root;
+          bus;
+          machine;
+          version;
           drm;
           hdp = remap_hdp fd node.gpu_id;
           clock = clock fd node.gpu_id;
@@ -610,6 +718,8 @@ type device = {
   fd : int;
   gpu : gpu;
   events : int array;
+  age : int Atomic.t;
+      (* the newest age of the signal event a wait gave back: [interrupts] *)
   mutable events_held : bool; (* until destroyed, once *)
   mutable queues : (int * int * mem Amd.memory list) list;
       (* id, doorbell, its memory *)
@@ -739,22 +849,42 @@ let raise_fault g =
   | Some why -> raise (Amd.Fault why)
   | None -> ()
 
-let sleep d ~ms =
+(* The signal event resets as a wait takes it, and an interrupt latches it only
+   while no wait is in the kernel's queue: a sleep that looked at the word
+   while another waits would miss it. KFD counts the event's signals, from 1 at
+   its creation (kfd_events.c, event_age), and a wait given the age a sleep
+   read before the word returns at once if the event fired since. The newest
+   age is stored once the slot is armed again, so that a sleep that reads it
+   reads the word after the arm: an interrupt the unarmed slot dropped came
+   after its release wrote the word. A KFD before ioctl 1.14 ignores the age
+   and gives none back, so there a sleep between its look and the kernel's
+   wait may still wait out [ms] ([event_age]). *)
+let first_age = 1
+
+let rec newer a v =
+  let o = Atomic.get a in
+  if v > o && not (Atomic.compare_and_set a o v) then newer a v
+
+let sleep d ~ms ~after =
   let g = d.gpu in
   raise_fault g;
-  let f =
-    match kfd_wait d.fd d.events ms g.node.gpu_id with
-    | f -> f
+  let age =
+    match kfd_sleep d.fd d.events ms g.node.gpu_id after with
+    | age -> age
     | exception Unix.Unix_error (e, _, _) ->
         arm d.events.(0);
         fault "waiting for KFD events" e
   in
   arm d.events.(0);
-  match f with
-  | None -> ()
-  | Some f ->
-      report g (fault_message f);
-      raise_fault g
+  if age >= 0 then newer d.age age
+  else begin
+    (* The exception events stay set, so a second look reads the fault. *)
+    (match kfd_wait d.fd [| d.events.(1); d.events.(2) |] 0 g.node.gpu_id with
+    | Some f -> report g (fault_message f)
+    | None | (exception Unix.Unix_error _) ->
+        report g "a KFD exception event reported a fault of the GPU");
+    raise_fault g
+  end
 
 (* Asks the exception events of the GPU's open devices, without waiting, for a
    fault no sleep has read yet. The events stay set: they reset only by hand. *)
@@ -767,6 +897,14 @@ let poll_faults fd g =
         | None | (exception Unix.Unix_error _) -> ())
     g.live
 
+(* The kernel driver answers EBUSY while a context other than the caller's
+   owns the state (amdgpu_ctx.c, amdgpu_ctx_set_stable_pstate). Before Linux
+   1b5e413713c0 ("drm/amdgpu: Fix context pstate override handling"), a
+   context that ends after the level changed forces the level saved when it
+   was made, takes ownership if that is a profile, and is freed, so the state
+   stays owned until a write to power_dpm_force_performance_level, which
+   clears the owner (amdgpu_pm.c,
+   amdgpu_set_power_dpm_force_performance_level). *)
 let stable_power g () =
   Amd.Lock.protect opening @@ fun () ->
   match g.node.gpu.target with
@@ -778,7 +916,10 @@ let stable_power g () =
           g.stable <- true;
           Ok ()
       | exception Unix.Unix_error (EBUSY, _, _) ->
-          Error "another process holds the GPU's stable power state"
+          Error
+            "another process holds the GPU's stable power state, or one that \
+             exited left it held, which writing auto to the GPU's \
+             power_dpm_force_performance_level, as root, frees"
       | exception Unix.Unix_error (e, _, _) ->
           Error
             (strf "the amdgpu driver refused the GPU's stable power state: %s"
@@ -862,12 +1003,15 @@ let path d ~gpus ~index : mem Amd.path =
        fun j -> j >= 0 && j < Array.length reached && reached.(j));
     map_peer = map_peer fd g;
     free = free fd g;
+    bus = Some g.bus;
+    dma = dma fd g;
     queue = queue d;
     retire = retire d;
     most_ring;
     hdp = g.hdp;
     interrupt = d.events.(0);
     hang_ms = Some hang_ms;
+    interrupts = (fun () -> Atomic.get d.age);
     sleep = sleep d;
     stable_power = stable_power g;
     stop = stop d;
@@ -904,7 +1048,7 @@ let open_ ~root ~word i =
     let* fd, g, events =
       Amd.Lock.protect opening (fun () ->
           let* fd = kfd_fd ~dev:(Filename.concat root "dev") in
-          let* g = acquire fd ~root ~gpus node in
+          let* g = acquire fd ~root ~gpus ~bus:(fst gpus.(i)) node in
           poll_faults fd g;
           match Atomic.get g.faulted with
           | Some why ->
@@ -917,7 +1061,16 @@ let open_ ~root ~word i =
               | events -> Ok (fd, g, events)
               | exception Amd.Fault why -> Error why))
     in
-    let d = { fd; gpu = g; events; events_held = true; queues = [] } in
+    let d =
+      {
+        fd;
+        gpu = g;
+        events;
+        age = Atomic.make first_age;
+        events_held = true;
+        queues = [];
+      }
+    in
     (* The events stay while a queue the path could not stop may still raise the
        interrupt. *)
     let give_back () = if d.queues = [] then drop_events d in
@@ -944,3 +1097,17 @@ let gpu_under ~root i : Rig_amd.t Rig_edge.opener =
   }
 
 let gpu i = gpu_under ~root:"/" i
+
+(* KFD keeps the age of signal events from ioctl 1.14 (kfd_ioctl.h, "Update
+   kfd_event_data"). *)
+let age_from = 1014
+
+let event_age () =
+  Amd.Lock.check "Rig_amd_amdgpu.event_age";
+  Amd.Lock.protect opening @@ fun () ->
+  match kfd_fd ~dev:"/dev" with
+  | Error _ -> false
+  | Ok fd -> (
+      match kfd_version fd with
+      | v -> v >= age_from
+      | exception Unix.Unix_error _ -> false)

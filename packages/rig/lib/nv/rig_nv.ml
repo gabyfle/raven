@@ -178,7 +178,11 @@ type rm = {
   release : int;
   client : int;
   alloc : parent:int -> int -> params option -> (int, refusal) result;
-  control : int -> int -> params option -> (unit, refusal) result;
+  token : int -> (int, refusal) result;
+  schedule : int -> params -> (unit, refusal) result;
+  boost : int -> (unit, refusal) result;
+  sm_errors : int -> params -> (unit, refusal) result;
+  mmu_faults : int -> params -> (unit, refusal) result;
   free : (parent:int -> int -> (unit, refusal) result) option;
 }
 
@@ -212,6 +216,8 @@ type 'm path = {
   reaches : int -> bool;
   map_peer : 'm memory -> 'm memory option;
   free : 'm memory -> unit;
+  bus : string option;
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
   register : int -> (unit, string) result;
   unregister : int -> (unit, string) result;
   check : unit -> unit;
@@ -317,12 +323,15 @@ let t_box = 14
 
 (* rig_nv_stubs.h's launch values, by slot: the grid's sizes along X, Y and Z,
    the group's, bank 0's address, the next descriptor's, the dynamic shared
-   memory. *)
+   memory, and the address and value of the release of a launch that ends a
+   submission. *)
 let v_grid_x = 0
 let v_block_x = 3
 let v_bank0 = 6
 let v_next = 7
 let v_shared = 8
+let v_word = 9
+let v_value = 10
 
 (* The sizes in the order of rig_nv_stubs.h's launch limits. *)
 let dims = Abi.Qmd.[ Grid X; Grid Y; Grid Z; Block X; Block Y; Block Z ]
@@ -431,8 +440,8 @@ external hand : int -> int -> int -> int -> int -> bool -> int
 external retired : int -> int -> int = "caml_rig_nv_retired" [@@noalloc]
 external rings_retired : int -> bool = "caml_rig_nv_retiring" [@@noalloc]
 
-external install_copy : int -> nativeint -> int -> string -> unit
-  = "caml_rig_nv_copy_kernel"
+external install_kernels : int -> nativeint -> nativeint -> int -> string -> unit
+  = "caml_rig_nv_kernels"
 [@@noalloc]
 
 external raise_word : int -> unit = "caml_rig_nv_raise" [@@noalloc]
@@ -534,6 +543,7 @@ type 'm dev = {
   key : 'm Type.Id.t;
   index : int;
   reaches : int -> bool; (* the path's *)
+  bus : string option; (* the path's *)
   capability : Abi.Gpu.t;
   flush : int option; (* the path's flush word *)
   word : 'm reg; (* kept, with the C state, for the process *)
@@ -606,6 +616,7 @@ let facts (T d) =
     alignment = region_alignment;
     capability = Abi.declare d.capability;
     word = R d.word;
+    bus = d.bus;
     edge = Nativeint.of_int d.self;
   }
 
@@ -902,7 +913,13 @@ let descriptors l base code per_thread (k : Cubin.kernel) =
   in
   let shared = { d with Abi.Qmd.shared = Some (Slot v_shared) } in
   let chain (d : Abi.Qmd.t) = { d with chain = Some (Slot v_next) } in
-  let qmds = List.map (Abi.Qmd.make l) [ d; chain d; shared; chain shared ] in
+  let released (d : Abi.Qmd.t) =
+    { d with releases = [ Abi.Qmd.Release (Slot v_word, Slot v_value) ] }
+  in
+  let qmds =
+    List.map (Abi.Qmd.make l)
+      [ d; chain d; shared; chain shared; released d; released shared ]
+  in
   let bank0_bytes =
     List.fold_left
       (fun n (b : Cubin.bank) -> if b.index = 0 then b.bytes else n)
@@ -1006,13 +1023,7 @@ let make_channels (type m) (p : m path) (module R : D.RELEASE) ~taken entries
     let* engine_object =
       in_rm "an engine" (p.rm.alloc ~parent:ch engine None)
     in
-    let token = params D.Work_submit_token.sizeof in
-    set token D.Work_submit_token.work_submit_token 0xffff_ffff;
-    let* () =
-      in_rm "the work submit token"
-        (p.rm.control ch D.nvc36f_ctrl_cmd_gpfifo_get_work_submit_token
-           (Some token))
-    in
+    let* token = in_rm "the work submit token" (p.rm.token ch) in
     let* () =
       in_rm (strf "registering channel %d" q) (of_path (p.register ch))
     in
@@ -1022,7 +1033,7 @@ let make_channels (type m) (p : m path) (module R : D.RELEASE) ~taken entries
         block_host + ring_at entries q;
         entries.(q);
         block_host + userd_at entries q + fst D.Userd.gp_put;
-        get token D.Work_submit_token.work_submit_token;
+        token;
         notifier_host;
       ]
     in
@@ -1042,10 +1053,7 @@ let make_channels (type m) (p : m path) (module R : D.RELEASE) ~taken entries
   in
   let schedule = params R.Group_schedule.sizeof in
   set schedule R.Group_schedule.b_enable 1;
-  let* () =
-    in_rm "scheduling the channels"
-      (p.rm.control group D.nva06c_ctrl_cmd_gpfifo_schedule (Some schedule))
-  in
+  let* () = in_rm "scheduling the channels" (p.rm.schedule group schedule) in
   let set =
     {
       id = block.address;
@@ -1063,7 +1071,6 @@ let make_channels (type m) (p : m path) (module R : D.RELEASE) ~taken entries
 (* The device's objects and memory, each given back by [taken] if a later step
    fails. *)
 let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
-  let rm = p.rm in
   let alloc kind bytes what =
     match path_alloc p kind bytes with
     | None -> Error (strf "no memory for the %s" what)
@@ -1148,19 +1155,7 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
       set_segments self q (segments_host + at) (segments.address + at)
         segment_bytes
     done;
-    let boost = params D.Perf_boost.sizeof in
-    set boost D.Perf_boost.duration D.nv2080_ctrl_perf_boost_duration_infinite;
-    set boost D.Perf_boost.flags
-      (bits D.nv2080_ctrl_perf_boost_flags_cuda
-         D.nv2080_ctrl_perf_boost_flags_cuda_yes
-      lor bits D.nv2080_ctrl_perf_boost_flags_cuda_priority
-            D.nv2080_ctrl_perf_boost_flags_cuda_priority_high
-      lor bits D.nv2080_ctrl_perf_boost_flags_cmd
-            D.nv2080_ctrl_perf_boost_flags_cmd_boost_to_max);
-    let* () =
-      in_rm "raising the GPU's clocks"
-        (rm.control p.subdevice D.nv2080_ctrl_cmd_perf_boost (Some boost))
-    in
+    let* () = in_rm "raising the GPU's clocks" (p.rm.boost p.subdevice) in
     set_doorbell self p.doorbell;
     set_launches self launches_host launches.address launch_bytes launches_bar;
     templates self p.gpu;
@@ -1172,24 +1167,25 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
       if set_clock self source bar then Ok ()
       else Error "the GPU's timer could not be read"
     in
-    (* The private copy kernel. On sm_80, sm_86, sm_87 and sm_89, a copy of
-       one row of at least 256 KiB between two of the device's own [Device]
-       allocations runs as this kernel on the compute channel
-       (rig_nv_ring.c's [kernel_copies] and [route]). Smaller copies, boxes
-       of more rows, fills, copies that touch host, [Pinned], [Mapped] or a
-       peer's memory, and every copy on other architectures, run on the copy
-       channel. The kernel's image takes
-       [Cubin.size] bytes of [Pinned] memory, and its descriptors lie in host
-       memory until the channels end. *)
+    (* The private copy and fill kernels. On sm_80, sm_86, sm_87 and sm_89,
+       a copy of one row of at least 256 KiB between two of the device's own
+       [Device] allocations, and a fill of as many bytes of one, run as these
+       kernels on the compute channel (rig_nv_ring.c's [kernel_copies] and
+       [route]). Smaller copies and fills, boxes of more rows, copies and
+       fills that touch host, [Pinned], [Mapped] or a peer's memory, and
+       every copy and fill on other architectures, run on the copy channel.
+       The kernels' image takes [Cubin.size] bytes of [Pinned] memory, and
+       their descriptors lie in host memory until the channels end. *)
     let* copy_kernel =
       match Copy_kernel.find (arch_of p.gpu.sm_version) with
       | None -> Ok None
       | Some bin ->
           let* c = Cubin.of_string bin in
           let k = Option.get (Cubin.kernel c "copy_bytes") in
+          let f = Option.get (Cubin.kernel c "fill_bytes") in
           let* code = alloc Pinned (Cubin.size c) "copy kernel" in
           let* code_host = host "copy kernel" code in
-          Ok (Some (c, k, code, code_host))
+          Ok (Some (c, k, f, code, code_host))
     in
     (* rig's word goes back with the device's mapping of it; rig frees a
        word of the device's own, with its page, once no queue waits on it. *)
@@ -1199,7 +1195,7 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
     in
     let owned =
       match copy_kernel with
-      | Some (_, _, code, _) -> code :: owned
+      | Some (_, _, _, code, _) -> code :: owned
       | None -> owned
     in
     let g = p.gpu in
@@ -1213,6 +1209,7 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
         key = p.key;
         index = p.index;
         reaches = p.reaches;
+        bus = p.bus;
         capability =
           {
             Abi.Gpu.compute_class = g.compute_class;
@@ -1247,13 +1244,16 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
     let* () =
       match copy_kernel with
       | None -> Ok ()
-      | Some (c, k, code, code_host) ->
-          let* l = Launch.make d.capability k in
+      | Some (c, k, f, code, code_host) ->
+          let* lk = Launch.make d.capability k in
+          let* lf = Launch.make d.capability f in
           let bytes = image_bytes c ~base:code.address in
-          (* This kernel has no stack, calls or local instructions. Its
+          (* These kernels have no stack, calls or local instructions. Their
              descriptors need none of the public launch's local reserve. *)
-          let launch = descriptors l code.address (code.address + k.code) 0 k in
-          install_copy self launch code_host bytes;
+          let launch l (k : Cubin.kernel) =
+            descriptors l code.address (code.address + k.code) 0 k
+          in
+          install_kernels self (launch lk k) (launch lf f) code_host bytes;
           Ok ()
     in
     Ok (T d)
@@ -1371,6 +1371,12 @@ let map_host (T d) a n =
       let m = placed Below_windows n (map a n) in
       Option.map (region d p None n) m
 
+(* rig asks only of the device's own regions. *)
+let dma (T d) (R r) ~fn =
+  match Type.Id.provably_equal d.key r.dev.key with
+  | None -> invalid_arg "Rig_nv.dma: another driver's region"
+  | Some Type.Equal -> (live d).path.dma r.mem ~fn
+
 (* Rings *)
 
 (* The rings [needed] numbers: each channel's segment ring, then the launch
@@ -1440,7 +1446,8 @@ let grow_channels d l want =
       {
         p.rm with
         alloc = (fun ~parent cls q -> lacking (p.rm.alloc ~parent cls q));
-        control = (fun obj cmd q -> lacking (p.rm.control obj cmd q));
+        token = (fun ch -> lacking (p.rm.token ch));
+        schedule = (fun group q -> lacking (p.rm.schedule group q));
       }
     in
     let record = ref 0 in
@@ -1638,9 +1645,6 @@ let report d l =
     | [ a; b ] when a = b -> [ a ]
     | errors -> errors
   in
-  let control (c : _ channels) cmd p =
-    Result.map_error why (l.path.rm.control c.debugger cmd (Some p))
-  in
   let sm = params S.sizeof and mmu = params M.sizeof in
   set sm S.num_s_ms_to_read sm_errors;
   let sm_fault i =
@@ -1667,13 +1671,13 @@ let report d l =
     let installed, _ = channels_state d.self in
     let c = List.find (fun s -> s.id = installed) l.sets in
     set sm S.h_target_channel c.handles.(0);
-    match control c D.nv83de_ctrl_cmd_debug_read_all_sm_error_states sm with
-    | Error e -> [ strf "reading the multiprocessors' errors: %s" e ]
+    match l.path.rm.sm_errors c.debugger sm with
+    | Error e -> [ strf "reading the multiprocessors' errors: %s" (why e) ]
     | Ok () when get sm S.mmu_fault_valid = 0 ->
         List.filter_map sm_fault (List.init sm_errors Fun.id)
     | Ok () -> (
-        match control c D.nv83de_ctrl_cmd_debug_read_mmu_fault_info mmu with
-        | Error e -> [ strf "reading the MMU's faults: %s" e ]
+        match l.path.rm.mmu_faults c.debugger mmu with
+        | Error e -> [ strf "reading the MMU's faults: %s" (why e) ]
         | Ok () -> List.init (get mmu M.count) mmu_fault)
   in
   channels @ faults

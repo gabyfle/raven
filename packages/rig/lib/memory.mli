@@ -98,6 +98,13 @@ val reached_write : memory -> bool
 (** [reached_write m] is {!reached_points} for the points {!wait_write}[ m]
     waits for. *)
 
+val uses_done : memory -> bool
+(** [uses_done m] is [true] iff every point that {!wait_points}[ m] waits
+    for is done as the values rig has seen answer it ({!Dev.seen_done}),
+    which may be [false] for work done behind a transport. It commits no
+    work, waits for none, calls no driver, never raises and allocates
+    nothing, so it may run under a device's lock. *)
+
 val check_points : int -> unit
 (** [check_points st] raises {!Dev.Lost} if a point of [st] is on a lost
     device and not done. *)
@@ -263,6 +270,10 @@ val mark_outside : alloc -> bool
 (** [mark_outside a] marks [a]'s memory outside the claims for good. It is
     [false], changing nothing, while claims hold the memory exclusive. *)
 
+val mark_reached : entry -> unit
+(** [mark_reached e] keeps [e] out of its owner's cache for good, since
+    another PCI function reaches it ({!Rig.Buffer.dma}). *)
+
 (** {1:borrows Mappings and borrows}
 
     A borrow of an allocation on a device is a memory record of that device
@@ -365,15 +376,17 @@ val of_io : device -> io_region -> access:access -> int -> memory
     drains again. *)
 
 val return_half : buffer -> unit
-(** [return_half b] returns [b], a staging half ({!Def.slot}) that its slot no
-    longer holds, as {!Rig.Buffer.free} returns memory: [b] is consumed, and
+(** [return_half b] returns [b], a staging half's buffer ({!Def.half}) that
+    its half no longer holds, as {!Rig.Buffer.free} returns memory: [b] is consumed, and
     its memory goes back once the work that uses it is done, through its
     device's retiring memory, so a leg still queued on it finishes first. A
     half that a claim holds is left to its collection. The caller holds no
     lock. *)
 
 val drain : device -> unit
-(** [drain d] releases the collected holds ({!hold_token}), moves [d]'s
+(** [drain d] releases the collected holds ({!hold_token}) and drains each
+    device whose stop returned and whose release list took records, since
+    no call on such a device is due. It then moves [d]'s
     collected memory whose points are settled to its cache or its driver,
     returns a Stopped device's cache and gives back its mappings of other
     devices' memory and words, and runs the pending releases whose value [d]
@@ -381,7 +394,9 @@ val drain : device -> unit
     kept. On an orphaned device it only routes [d]'s release list and lets
     go of the kept values pending on it, since its frees would call its
     parent's driver. It may raise {!Dev.Lost} when the read of a word with
-    no host address loses its device. *)
+    no host address loses its device, and the exceptions of a driver's
+    free, of [d] or of another device it drains; a drain of the other
+    devices that raises leaves them to the next drain. *)
 
 val reclaiming : device -> pool:device -> int -> (unit -> 'a option) -> 'a
 (** [reclaiming d ~pool n f] is the first [Some] result of [f], a try at [n]

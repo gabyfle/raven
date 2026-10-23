@@ -16,7 +16,7 @@
      kernel-open/common/inc/nv-ioctl-numbers.h and nv-ioctl.h (the escape
      ioctls), src/nvidia/arch/nvalloc/unix/include/nv_escape.h,
      src/common/sdk/nvidia/inc/nvos.h (NVOS00, NVOS02, NVOS21, NVOS32,
-     NVOS33, NVOS46, NVOS54), ctrl0000gpu.h, ctrl0080gpu.h, ctrl2080fb.h,
+     NVOS33, NVOS54), ctrl0000gpu.h, ctrl0080gpu.h, ctrl2080fb.h,
      ctrl2080gpu.h, ctrl2080gr.h, and kernel-open/nvidia-uvm/uvm_ioctl.h and
      uvm_linux_ioctl.h.
    - Linux's Documentation/ABI/testing/sysfs-bus-pci: a function's vendor
@@ -46,13 +46,11 @@ let doorbell_at = 0x90
 (* The addresses a channel's registration with unified memory takes. *)
 let channel_range = 0x400_0000
 
-(* The address space's first address and size, and the virtual memory object's
-   last address: 49 bits. *)
+(* The address space's first address and size: 49 bits. *)
 let va_base = 0x1000
 let va_size = 0x1fffffb000000
-let va_limit = 0x1ffffffffffff
 let round_up n a = (n + a - 1) / a * a
-let bits (lo, n) v = (v land ((1 lsl n) - 1)) lsl lo
+let bits = Rm.bits
 
 (* Work that the RM's watchdog does not bound is hung once it has not advanced
    for 30 s, the bound of a GPU driven without a kernel driver. *)
@@ -62,10 +60,11 @@ let hang_ms = 30_000
 
 type gpu = {
   c : Rm.t;
+  root : string; (* the machine's root *)
   file : string; (* its device file, [/dev/nvidiaN] under the machine's root *)
+  bus : string;
   device : int;
   subdevice : int;
-  virtmem : int;
   vaspace : int;
   uuid : string;
   doorbell : int;
@@ -171,30 +170,6 @@ let map_to_cpu g h size va =
     let* () = Rm.map fd va size in
     Ok true
 
-(* Maps the memory object [h] at [va] of [g]'s virtual memory: [Ok false] if [g]
-   has no memory for the mapping's page tables. *)
-let map_dma g va size h =
-  let (module R : D.RELEASE) = g.c.layouts in
-  let module M = R.Nvos46 in
-  let m = params M.sizeof in
-  set m M.h_client g.c.root;
-  set m M.h_device g.device;
-  set m M.h_dma g.virtmem;
-  set m M.h_memory h;
-  set m M.length size;
-  set m M.flags
-    (bits D.nvos46_flags_page_size D.nvos46_flags_page_size_4kb
-    lor bits D.nvos46_flags_cache_snoop D.nvos46_flags_cache_snoop_enable
-    lor bits D.nvos46_flags_dma_offset_fixed
-          D.nvos46_flags_dma_offset_fixed_true);
-  set m M.dma_offset va;
-  let what = "mapping GPU memory" in
-  let* () = Rm.escape g.c.ctl D.nv_esc_rm_map_memory_dma m what in
-  let* ok = fits g what (get m M.status) in
-  if ok && get m M.dma_offset <> va then
-    Error "mapping GPU memory: the driver chose another address"
-  else Ok ok
-
 let set_uuid p (at, _) uuid =
   String.iteri (fun i ch -> Bigarray.Array1.set p (at + i) ch) uuid
 
@@ -228,9 +203,8 @@ let uvm_free c va size =
   Rm.uvm_call c D.uvm_free u U.rm_status "unmapping GPU memory"
 
 (* Makes the unified memory range of [size] bytes at [va] and maps the memory
-   object [h] there for [g], in [g]'s virtual memory first. [Ok false] if [g]
-   has no memory for it; the range is then freed, so that the addresses stay
-   free. *)
+   object [h] there for [g]. [Ok false] if [g] has no memory for it; the range
+   is then freed, so that the addresses stay free. *)
 let uvm_map g va size h =
   let module E = D.Uvm_create_external_range in
   let e = params E.sizeof in
@@ -240,10 +214,7 @@ let uvm_map g va size h =
     Rm.uvm_call g.c D.uvm_create_external_range e E.rm_status
       "reserving GPU addresses"
   in
-  let mapped =
-    let* ok = map_dma g va size h in
-    if ok then map_external g va size h else Ok false
-  in
+  let mapped = map_external g va size h in
   match mapped with
   | Ok true -> Ok true
   | Ok false | Error _ ->
@@ -533,6 +504,58 @@ let map_peer g (m : mem Rig_nv.memory) =
 
 let free g (m : mem Rig_nv.memory) = give g m.data.range
 
+(* Another function's DMA
+
+   The kernel driver exports RM memory objects as one dma-buf through
+   NV_ESC_EXPORT_TO_DMABUF_FD on a device file of the GPU (nv.c,
+   nv-dmabuf.c's nv_dma_buf_export): with [fd] -1 it makes the dma-buf,
+   [totalSize] bytes, from [numObjects] handles with their offsets and sizes,
+   dups each object, so the dma-buf keeps its memory past the region's free,
+   and returns the descriptor, opened O_RDWR | O_CLOEXEC, in [fd]. It answers
+   NV_ERR_NOT_SUPPORTED where the module exports no dma-buf, as only the open
+   modules do. The default mapping type serves every importer, mapping video
+   memory through BAR1, or as the host's own pages on a GPU coherent with the
+   host, and the importer's attach refuses a topology the module does not
+   support (nv_dma_buf_attach). A region lies in its range's object, at its
+   distance from the range's first byte. *)
+let dma g (m : mem Rig_nv.memory) ~fn =
+  let* () = Sysfs.known g.root fn in
+  let r = m.data.range in
+  let page = Rm.host_page () in
+  if r.bytes mod page <> 0 then
+    Error
+      (strf
+         "the memory's %d bytes are no whole number of the host's %d-byte pages"
+         r.bytes page)
+  else
+    let module E = D.Export_dma_buf in
+    let p = params E.sizeof in
+    let first (at, n, _) = (at, n) in
+    set p E.fd (-1);
+    set p E.h_client g.c.root;
+    set p E.total_objects 1;
+    set p E.num_objects 1;
+    set p E.index 0;
+    set p E.total_size r.bytes;
+    set p E.mapping_type D.nv_dmabuf_export_mapping_type_default;
+    set p (first E.handles) r.memory;
+    set p (first E.offsets) 0;
+    set p (first E.sizes) r.bytes;
+    let what = "exporting GPU memory as a dma-buf" in
+    let* exported =
+      with_file g (fun fd -> Rm.escape fd D.nv_esc_export_to_dmabuf_fd p what)
+    in
+    match exported with
+    | None -> Error (what ^ ": the process has no file left")
+    | Some () when get p E.status = D.nv_err_not_supported ->
+        Error
+          "NVIDIA's kernel driver exports no dma-buf of this GPU's memory: \
+           that needs its open kernel modules"
+    | Some () ->
+        let* () = Rm.check g.c what (get p E.status) in
+        Ok
+          (Rig_edge.Dmabuf { fd = get p E.fd; offset = m.data.va - r.gpu_addr })
+
 (* Channels *)
 
 (* Registers the channel [ch] with unified memory at a range of its own. *)
@@ -653,10 +676,10 @@ let gr_info c subdevice =
   Ok
     (List.init n (fun i -> get infos (fst I.data + (i * I.sizeof), snd I.data)))
 
-(* The frame buffer's fact [index], in bytes. *)
 let why = function Rig_nv.Lacking why | Refused why -> why
 
-let fb_info c rm subdevice index =
+(* The frame buffer's fact [index], in bytes. *)
+let fb_info c subdevice index =
   let (module R : D.RELEASE) = c.Rm.layouts in
   let module G = R.Fb_get_info in
   let module F = D.Fb_info in
@@ -668,24 +691,17 @@ let fb_info c rm subdevice index =
     (at + f, n)
   in
   set p (elt F.index) index;
-  let* () =
-    Result.map_error why
-      (rm.Rig_nv.control subdevice D.nv2080_ctrl_cmd_fb_get_info_v2 (Some p))
-  in
+  let* () = Rm.control c subdevice D.nv2080_ctrl_cmd_fb_get_info_v2 p in
   (* The RM reports the frame buffer's facts in KiB. *)
   Ok (get p (elt F.data) * 1024)
 
 (* The path's hang bound: [None] while the RM's watchdog runs on the GPU and
    ends work that holds it too long. It does not run on a GPU without a
    display. *)
-let hang_bound rm subdevice =
+let hang_bound c subdevice =
   let module W = D.Watchdog_info in
   let p = params W.sizeof in
-  let* () =
-    Result.map_error why
-      (rm.Rig_nv.control subdevice D.nv2080_ctrl_cmd_rc_get_watchdog_info
-         (Some p))
-  in
+  let* () = Rm.control c subdevice D.nv2080_ctrl_cmd_rc_get_watchdog_info p in
   let running = D.nv2080_ctrl_rc_get_watchdog_info_flags_running in
   if get p W.watchdog_status_flags land running <> 0 then Ok None
   else Ok (Some hang_ms)
@@ -712,10 +728,7 @@ let make_gpu c ~dev ~index bus =
     let* () = Rm.register file ~ctl:c.ctl in
     let id = params D.Id_info.sizeof in
     set id D.Id_info.gpu_id gpu_id;
-    let* () =
-      Result.map_error why
-        (rm.control c.root D.nv0000_ctrl_cmd_gpu_get_id_info_v2 (Some id))
-    in
+    let* () = Rm.control c c.root D.nv0000_ctrl_cmd_gpu_get_id_info_v2 id in
     let instance = get id D.Id_info.device_instance in
     let alloc ~parent cls f size =
       let p = params size in
@@ -735,11 +748,6 @@ let make_gpu c ~dev ~index bus =
     taken (fun () -> ignore (Rm.free c ~parent:c.root device));
     let* subdevice =
       alloc ~parent:device D.nv20_subdevice_0 ignore D.Nv2080_alloc.sizeof
-    in
-    let* virtmem =
-      alloc ~parent:device D.nv01_memory_virtual
-        (fun p -> set p D.Memory_virtual_alloc.limit va_limit)
-        D.Memory_virtual_alloc.sizeof
     in
     let (module R : D.RELEASE) = c.layouts in
     let* vaspace =
@@ -775,20 +783,15 @@ let make_gpu c ~dev ~index bus =
       | [ a; b; d; e; f ] -> Ok (a, b, d, e, f)
       | _ -> Error "reading the graphics engine's facts"
     in
-    let* budget =
-      fb_info c rm subdevice D.nv2080_ctrl_fb_info_index_heap_size
-    in
-    let* hang_ms = hang_bound rm subdevice in
+    let* budget = fb_info c subdevice D.nv2080_ctrl_fb_info_index_heap_size in
+    let* hang_ms = hang_bound c subdevice in
     let module Gi = D.Gid_info in
     let gid = params Gi.sizeof in
     set gid Gi.flags
       (bits D.nv2080_gpu_cmd_gpu_get_gid_flags_format
          D.nv2080_gpu_cmd_gpu_get_gid_flags_format_binary);
     set gid Gi.length 16;
-    let* () =
-      Result.map_error why
-        (rm.control subdevice D.nv2080_ctrl_cmd_gpu_get_gid_info (Some gid))
-    in
+    let* () = Rm.control c subdevice D.nv2080_ctrl_cmd_gpu_get_gid_info gid in
     let data, _, _ = Gi.data in
     let uuid = String.init 16 (fun i -> Bigarray.Array1.get gid (data + i)) in
     let* usermode =
@@ -803,10 +806,11 @@ let make_gpu c ~dev ~index bus =
     let g =
       {
         c;
+        root = Filename.dirname dev;
         file = path;
+        bus;
         device;
         subdevice;
-        virtmem;
         vaspace;
         uuid;
         doorbell;
@@ -922,6 +926,8 @@ let path g =
     reaches = (fun i -> not (List.mem i g.refused));
     map_peer = map_peer g;
     free = free g;
+    bus = Some g.bus;
+    dma = dma g;
     register = register g;
     unregister = unregister g;
     (* The RM reports the GPU's faults through the channels; channels the

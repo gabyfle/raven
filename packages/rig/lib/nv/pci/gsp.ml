@@ -44,19 +44,52 @@ type placement = {
   space : Space.t;
 }
 
-type buffer = { size : int; phys : bool; virt : bool; local : bool }
+type buffer = { size : int; phys : bool; virt : bool }
+
+(* The graphics engine's buffers, from the golden context: the size of a
+   context's own main, PM and patch buffers, and each of the GPU's global
+   buffers, by promote id, at its address in the process's page tables, which
+   every address space of the process's clients shares. *)
+type graphics = {
+  main : int;
+  pm : int;
+  patch : int;
+  globals : (int * int) list;
+}
+
+(* GPU memory a falcon reads an image from: its physical address and the
+   window on it. *)
+type region = { pa : int; w : Window.t }
 
 (* How the boot starts the GSP: on Ampere and Ada, FWSEC and then the booter,
-   which the falcons read from GPU memory; on Blackwell, the FSP's ops, which
-   point to the FMC in system memory. *)
-type start = Legacy of Vbios.fwsec * Images.booter | Cot of Falcon.op list
+   which the falcons read from GPU memory, FWSEC's FRTS command set up for
+   the GPU's memory; on Blackwell, the FSP's ops, which point to the FMC in
+   system memory. FWSEC's region holds the image of either of its commands,
+   and the booters' the larger booter, so that the stop loads its own. *)
+type start =
+  | Legacy of {
+      fwsec : Vbios.fwsec;
+      frts : int;
+      booters : Images.booters;
+      fwsec_at : region;
+      booter_at : region;
+    }
+  | Cot of Falcon.op list
 
-(* Each channel's runlist changes under the GSP's lock by one store of a map
-   made first, so an exception leaves the table whole. *)
+(* Channels and channel groups by handle. Each table changes under the GSP's
+   lock by one store of a map made first, so an exception leaves it whole. *)
 module Channels = Map.Make (Int)
 
+(* A channel's hardware id and runlist, which its work submit token names. The
+   runlist is [None] where the GPU has no engine of the channel's type. *)
+type channel = { id : int; runlist : int option }
+
+(* A channel group's runlist, as [channel]'s, and the physical address of its
+   method buffer, which each of its channels is described with. *)
+type group = { runlist : int option; mthd : int }
+
 (* GPU memory the process gave the GSP for an object: a channel's instance
-   block and method buffer, or a compute engine's context buffers. *)
+   block, a method buffer, or a compute engine's context buffers. *)
 type given = Mapped of Page_table.mapping | Block of int
 
 (* An object of one of the process's clients: its parent, and the memory the
@@ -77,16 +110,21 @@ type t = {
   lock : Rig_nv.Lock.t;
   libos : int; (* the libos arguments' bus address, for a resumption *)
   meta : int; (* the WPR metadata's bus address *)
+  flush : (int * int) list; (* the flush page's registers and their values *)
   start : start;
   mutable fault : string option;
+  mutable reports : (string * string) list;
+      (* since the last call began, the latest report of each error the GSP
+         logged, by subject, the latest first ([Rpc.report]) *)
   mutable unanswered : bool; (* a call waited out its bound *)
   mutable sequencing : bool; (* a CPU sequence runs, or an exception cut it *)
   mutable next : int; (* the next handle the process names an object with *)
   mutable clients : int; (* the next client handle *)
   mutable runlists : (int * int) list; (* each engine's runlist *)
-  mutable channels : int Channels.t; (* each channel's runlist *)
+  mutable groups : group Channels.t;
+  mutable channels : channel Channels.t;
   mutable held : held Objects.t; (* under [lock] *)
-  mutable buffers : (int * buffer) list; (* the graphics context's *)
+  mutable graphics : graphics;
   taken : sys list ref; (* the system memory the boot took *)
 }
 
@@ -139,18 +177,20 @@ let boot_pool start =
   let room n = 2 * (round_up n page + page) in
   let images =
     match start with
-    | `Booter (b : Images.booter) ->
-        room Vbios.window + room (String.length b.image)
+    | `Booter ({ load; unload } : Images.booters) ->
+        room Vbios.window
+        + room (Int.max (String.length load.image) (String.length unload.image))
     | `Fmc _ -> 0
   in
   round_up (page + images) (2 * mib)
 
 (* GPU memory a falcon reads, from the boot pool, which the memory BAR reaches
-   however small: its physical address and the window on it. *)
+   however small: its physical address and the window on it. Each image is
+   written whole before a falcon reads it, so the memory is not zeroed. *)
 let vram p n =
-  match Page_table.palloc ~boot:true p.tables n with
+  match Page_table.palloc ~zero:false ~boot:true p.tables n with
   | None -> Error "no GPU memory in the boot pool for a falcon's image"
-  | Some pa -> Ok (pa, Window.sub p.bar pa (round_up n page))
+  | Some pa -> Ok { pa; w = Window.sub p.bar pa (round_up n page) }
 
 let blit (r : Images.range) w off =
   Window.blit_string r.contents r.at w off r.length
@@ -221,6 +261,41 @@ let radix3 sys (image : Images.range) =
   done;
   Ok s
 
+(* The registers that name the page the GPU reads when it flushes its writes
+   to system memory, and their values for the page at bus address [a], the
+   high word first, as NVIDIA's RM writes them
+   (kmemsysProgramSysmemFlushBuffer_GA100 and _GB10B). The flush, a read of
+   the page, runs at every system memory barrier, a falcon's reset among them;
+   a reset leaves the registers at address 0. Ampere and Ada take [a]'s bits
+   46:8, Blackwell its bits 51:0. *)
+let flush_registers (c : Chip.t) a =
+  let module L = Defs.Legacy in
+  let module B = Defs.Blackwell in
+  let low = 0xffff_ffff in
+  let regs, limit =
+    match c.family with
+    | Ampere | Ada ->
+        let shift = Defs.nv_pfb_niso_flush_sysmem_addr_shift in
+        let s = a lsr shift in
+        ( [
+            ( L.nv_pfb_niso_flush_sysmem_addr_hi,
+              put L.nv_pfb_niso_flush_sysmem_addr_hi_adr_63_40 (s lsr 32) );
+            ( L.nv_pfb_niso_flush_sysmem_addr,
+              put L.nv_pfb_niso_flush_sysmem_addr_adr_39_08 (s land low) );
+          ],
+          (Defs.nv_pfb_niso_flush_sysmem_addr_hi_mask + 1) lsl (32 + shift) )
+    | Blackwell ->
+        ( [
+            ( B.nv_pfb_fbhub0_pcie_flush_sysmem_addr_hi,
+              put B.nv_pfb_fbhub0_pcie_flush_sysmem_addr_hi_adr (a lsr 32) );
+            ( B.nv_pfb_fbhub0_pcie_flush_sysmem_addr_lo,
+              put B.nv_pfb_fbhub0_pcie_flush_sysmem_addr_lo_adr (a land low) );
+          ],
+          (Defs.nv_pfb_fbhub0_pcie_flush_sysmem_addr_hi_adr_mask + 1) lsl 32 )
+  in
+  if a < limit then Ok regs
+  else Error (strf "the GPU cannot name its flush page at bus address 0x%x" a)
+
 (* Calls *)
 
 (* How long the GSP takes to answer a call, and to boot. *)
@@ -265,6 +340,10 @@ let drain g ~want =
             (match Rpc.fault m with
             | Some f when g.fault = None -> g.fault <- Some f
             | _ -> ());
+            (match Rpc.report m with
+            | Some (k, r) ->
+                g.reports <- (k, r) :: List.remove_assoc k g.reports
+            | None -> ());
             Msgq.consume g.q;
             Ok ()
           end
@@ -281,16 +360,24 @@ let drain g ~want =
 
 (* Records a call the GSP left unanswered past its bound as the GPU's fault:
    the GSP's queue is then in a state no later call can trust, and each would
-   wait out its bound in vain, the stop's unload too. *)
+   wait out its bound in vain, the stop's unload too. The error says what the
+   GSP reported: the GPU's first fault, then the errors it logged while the
+   call waited, each subject's last report once, the earliest first. *)
 let unanswered g = function
   | Ok () -> Ok ()
   | Error why ->
+      let said = Option.to_list g.fault @ List.rev_map snd g.reports in
+      let why =
+        if said = [] then why
+        else strf "%s; the GSP reported: %s" why (String.concat "; " said)
+      in
       g.unanswered <- true;
       if g.fault = None then g.fault <- Some why;
       Error why
 
-let wait_for g fn =
-  let found = ref (Error (strf "no answer to call %d" fn)) in
+(* [what] names the call in errors: its number, and what it asks. *)
+let wait_for g ?(what = "") fn =
+  let found = ref (Error (strf "no answer to call %d%s" fn what)) in
   let answered () =
     match drain g ~want:(Some fn) with
     | Ok None -> false
@@ -304,20 +391,21 @@ let wait_for g fn =
   let* () =
     unanswered g
       (Function.wait g.p.chip.fn ~us:(answer_ms * 1000)
-         (strf "the GSP's answer to call %d" fn)
+         (strf "the GSP's answer to call %d%s" fn what)
          answered)
   in
   !found
 
 let send g fn body =
+  g.reports <- [];
   unanswered g
     (Function.wait g.p.chip.fn ~us:(answer_ms * 1000)
        "room in the GSP's command queue" (fun () -> Msgq.send g.q fn body))
 
-let call g fn body =
+let call g ?what fn body =
   Rig_nv.Lock.protect g.lock (fun () ->
       let* () = send g fn body in
-      wait_for g fn)
+      wait_for g ?what fn)
 
 (* Every error of a drain is recorded as the GPU's fault inside it. *)
 let drained g = ignore (drain g ~want:None : (_, _) result)
@@ -372,6 +460,7 @@ let control g ~client obj cmd p =
   let* answer =
     failed
       (call g Defs.nv_vgpu_msg_function_gsp_rm_control
+         ~what:(strf " (command 0x%x)" cmd)
          (Rpc.rm_control ~client ~obj ~cmd body))
   in
   let* status, out = failed (Rpc.rm_answer `Control answer) in
@@ -387,6 +476,7 @@ let alloc_object g ~client ~parent ~obj cls p =
   let* answer =
     failed
       (call g Defs.nv_vgpu_msg_function_gsp_rm_alloc
+         ~what:(strf " (class 0x%x)" cls)
          (Rpc.rm_alloc ~client ~parent ~obj ~cls body))
   in
   let* status, _ = failed (Rpc.rm_answer `Alloc answer) in
@@ -418,7 +508,8 @@ let given g ~client obj m =
           g.held)
 
 (* Under [g]'s lock: takes [obj] of [client] and every object under it out of
-   [g]'s records and runlists, and is the memory given for them. *)
+   [g]'s records and its channels' and groups' tables, which frees the
+   channels' hardware ids, and is the memory given for them. *)
 let take_freed g ~client obj =
   let rec under gone =
     let more =
@@ -440,6 +531,7 @@ let take_freed g ~client obj =
   in
   let drop f t = List.fold_left (fun t o -> f o t) t gone in
   g.held <- drop (fun o -> Objects.remove (client, o)) g.held;
+  g.groups <- drop Channels.remove g.groups;
   g.channels <- drop Channels.remove g.channels;
   memory
 
@@ -470,8 +562,8 @@ let memdesc p field ~base ~size ~space =
   Rig_nv.set p (at field M.address_space) space;
   Rig_nv.set p (at field M.cache_attrib) Defs.nv_memory_cached
 
-(* A channel's instance block, RAMFC and method buffer, which CPU-RM gives the
-   GSP: a page, its first 0x200 bytes the RAMFC, and 0x5000 bytes. *)
+(* A channel's instance block and RAMFC, which CPU-RM gives the GSP, a page and
+   its first 0x200 bytes, and the 0x5000 bytes of a method buffer. *)
 let instance_size = 0x1000
 let ramfc_size = 0x200
 let method_buffer_size = 0x5000
@@ -480,16 +572,27 @@ let userd_size = 0x400
 (* The size the error notifier is described with. *)
 let notifier_size = 0xecc
 
-let channel_memory g ~client ~locate obj p =
+(* A method buffer, recorded for [obj] of [client]. *)
+let method_buffer g ~client obj =
+  match on_tables g (fun t -> Page_table.palloc t method_buffer_size) with
+  | Some pa ->
+      given g ~client obj (Block pa);
+      Ok pa
+  | None -> Error (Rig_nv.Lacking "no GPU memory for a method buffer")
+
+(* The memory the channel [obj] that [p] allocates under [parent] is described
+   with. A channel of a group takes the group's method buffer; any other, as
+   it stands for a group of its own, one of its own. *)
+let channel_memory g ~client ~locate ~parent obj p =
   let module G = Defs.Gpfifo_alloc in
   let* ramfc = lacking (object_memory g ~client obj instance_size) in
+  let group =
+    Rig_nv.Lock.protect g.lock (fun () -> Channels.find_opt parent g.groups)
+  in
   let* mthd =
-    match on_tables g (fun t -> Page_table.palloc t method_buffer_size) with
-    | Some pa ->
-        given g ~client obj (Block pa);
-        Ok pa
-    | None ->
-        Error (Rig_nv.Lacking "no GPU memory for a channel's method buffer")
+    match group with
+    | Some { mthd; _ } -> Ok mthd
+    | None -> method_buffer g ~client obj
   in
   let fb = Defs.addr_fbmem in
   memdesc p G.ramfc_mem ~base:(paddr ramfc) ~size:ramfc_size ~space:fb;
@@ -515,45 +618,40 @@ let channel_memory g ~client ~locate obj p =
         Ok ()
   end
 
-(* The context buffers a compute engine's channel needs, promoted twice: their
-   physical memory, then their virtual addresses. The memory is recorded for
-   the engine [obj]. *)
-let promote g ~client ~subdevice ~obj channel buffers ?(have = []) ~virt ~phys
-    () =
-  let module Pr = Defs.Promote_ctx in
-  let module E = Defs.Promote_entry in
-  let p = Rig_nv.params Pr.sizeof in
-  Rig_nv.set p Pr.entry_count (List.length buffers);
-  Rig_nv.set p Pr.engine_type Defs.nv2080_engine_type_graphics;
-  Rig_nv.set p Pr.h_chan_client client;
-  Rig_nv.set p Pr.h_object channel;
-  let rec fill i made = function
-    | [] -> Ok (List.rev made)
-    | (id, b) :: rest ->
-        let v = Option.value virt ~default:b.virt
-        and ph = Option.value phys ~default:b.phys in
-        let* m =
-          match List.assoc_opt id have with
-          | Some m -> Ok m
-          | None -> lacking (object_memory g ~client obj b.size)
-        in
-        let f x = elt Pr.promote_entry i x in
-        Rig_nv.set p (f E.buffer_id) id;
-        Rig_nv.set p (f E.gpu_virt_addr) (if v then m.Page_table.va else 0);
-        Rig_nv.set p (f E.b_initialize) (Bool.to_int ph);
-        Rig_nv.set p (f E.gpu_phys_addr) (if ph then paddr m else 0);
-        Rig_nv.set p (f E.size) (if ph then b.size else 0);
-        (* NV2080_CTRL_GPU_PROMOTE_CTX_PHYS_ATTR: in the GPU's memory,
-           cached. *)
-        Rig_nv.set p (f E.phys_attr) (if ph then 0x4 else 0);
-        Rig_nv.set p (f E.b_nonmapped) (Bool.to_int (ph && not v));
-        fill (i + 1) ((id, m) :: made) rest
+(* Hands the GSP the buffers [l] of the graphics context of [channel] of
+   [client], through the client's [subdevice]. *)
+let promote g ~client ~subdevice ~channel l =
+  let r = Rpc.promote_ctx ~client ~channel l in
+  let p = Rig_nv.params (String.length r) in
+  blit_params r p;
+  control g ~client subdevice Defs.nv2080_ctrl_cmd_gpu_promote_ctx (Some p)
+
+(* The context of the compute object [obj] of [client] on [channel], in an
+   address space another owner keeps, as NVIDIA's RM and its UVM hand it
+   over: its main, PM and patch buffers, recorded for [obj], initialized before
+   the object is made (kgrobjPromoteContext, from the object's constructor,
+   runs before the RPC); then, by the function this returns once the object
+   is made, their addresses and the global buffers' bound
+   (nvGpuOpsBindChannelResources). *)
+let context g ~client ~subdevice ~obj channel =
+  let gr = g.graphics in
+  let own size =
+    let* m = lacking (object_memory g ~client obj size) in
+    Ok { Rpc.pa = paddr m; size; va = m.va }
   in
-  let* made = fill 0 [] buffers in
-  let* () =
-    control g ~client subdevice Defs.nv2080_ctrl_cmd_gpu_promote_ctx (Some p)
+  let* main = own gr.main in
+  (* NVIDIA's RM fails such an object when the GPU has no PM buffer
+     (kgrctxShouldPreAllocPmBuffer, kgrctxAllocPmBuffer). *)
+  let* pm =
+    if gr.pm = 0 then
+      Error (Rig_nv.Refused "the GPU reports no PM context buffer")
+    else own gr.pm
   in
-  Ok made
+  let* patch = own gr.patch in
+  let init, bind = Rpc.compute_context ~main ~pm ~patch ~globals:gr.globals in
+  let promote = promote g ~client ~subdevice ~channel in
+  let* () = promote init in
+  Ok (fun () -> promote bind)
 
 (* The root table's entries: 4 on version 2, 2 on version 3. *)
 let root_entries (c : Chip.t) =
@@ -566,25 +664,83 @@ let root_entries (c : Chip.t) =
    promoted. *)
 type objects = { mutable subdevice : int }
 
+(* The runlist of the engine of type [e], the graphics engine's for none, as
+   for a channel given no engine (kfifoGetDefaultRunlist_GM107). [e] is an
+   NV2080 engine type, the table's are RM engine types: the two agree for the
+   graphics and copy engines (cl2080_notification.h, gpu_engine_type.h). *)
+let runlist g e =
+  let e = if e = 0 then Defs.nv2080_engine_type_graphics else e in
+  List.assoc_opt e g.runlists
+
+(* Records the channel group [obj] of [client] that [p] allocates: its
+   engine's runlist, which every channel of the group takes
+   (kchangrpapiConstruct_IMPL), and its method buffer. CPU-RM allocates a
+   buffer for each of the group's runqueues with the group
+   (kchangrpAllocFaultMethodBuffers_GV100) and describes the one of a
+   channel's runqueue in the channel's allocation; the GSP keeps the first
+   it is given for each runqueue (kchannelConstruct_IMPL). The driver's
+   channels all run on runqueue 0, as their flags leave
+   NVOS04_FLAGS_GROUP_CHANNEL_RUNQUEUE at 0, so a group takes one buffer. *)
+let name_group g ~client obj p =
+  let* mthd = method_buffer g ~client obj in
+  let runlist = runlist g (Rig_nv.get p Defs.Channel_group_alloc.engine_type) in
+  Rig_nv.Lock.protect g.lock (fun () ->
+      g.groups <- Channels.add obj { runlist; mthd } g.groups);
+  Ok ()
+
+(* Names the hardware id of the channel [obj] that [p] allocates under
+   [parent], and records it with the channel's runlist, before the GSP makes
+   the channel. Beside a GSP, NVIDIA's RM chooses the id
+   ([Rpc.free_channel_id], kchannelAllocHwID_GM107) and gives it in the flags
+   (_kchannelSendChannelAllocRpc); flags that fix one already, as the golden
+   channel's do, keep it. A channel in a group takes the group's engine, and
+   so its runlist; any other, its own engine's (kchannelConstruct_IMPL). *)
+let name_channel g ~parent obj p =
+  let module G = Defs.Gpfifo_alloc in
+  Rig_nv.Lock.protect g.lock @@ fun () ->
+  let held id = Channels.exists (fun _ c -> c.id = id) g.channels in
+  let flags = Rig_nv.get p G.flags in
+  let id =
+    match Rpc.channel_id flags with
+    | Some _ as id -> id
+    | None -> Rpc.free_channel_id held
+  in
+  match id with
+  | None -> Error (Rig_nv.Lacking "no hardware id is free for another channel")
+  | Some id ->
+      Rig_nv.set p G.flags (Rpc.channel_flags flags id);
+      let runlist =
+        match Channels.find_opt parent g.groups with
+        | Some group -> group.runlist
+        | None -> runlist g (Rig_nv.get p G.engine_type)
+      in
+      g.channels <- Channels.add obj { id; runlist } g.channels;
+      Ok ()
+
 let alloc g ~client ~locate ~objects ~parent cls p =
   let channel_class, compute_class, _ = classes g.p.chip.family in
   let h, obj = made g ~client ~parent cls in
+  let compute = cls = compute_class && client <> priv_root in
   let* () =
     match p with
     | Some p when cls = channel_class ->
-        channel_memory g ~client ~locate obj p
+        let* () = channel_memory g ~client ~locate ~parent obj p in
+        name_channel g ~parent obj p
+    | Some p when cls = Defs.kepler_channel_group_a ->
+        name_group g ~client obj p
     | _ -> Ok ()
   in
+  let* bind =
+    if compute then
+      context g ~client ~subdevice:objects.subdevice ~obj parent
+    else Ok (fun () -> Ok ())
+  in
   let* _ = alloc_object g ~client ~parent ~obj:h cls p in
-  if cls = channel_class then
-    Option.iter
-      (fun p ->
-        let e = Rig_nv.get p Defs.Gpfifo_alloc.engine_type in
-        let runlist = Option.value ~default:0 (List.assoc_opt e g.runlists) in
-        Rig_nv.Lock.protect g.lock (fun () ->
-            g.channels <- Channels.add obj runlist g.channels))
-      p;
   if cls = Defs.nv20_subdevice_0 then objects.subdevice <- obj;
+  (* The golden context's objects get none of this: its address space is the
+     RM's own, whose root the GSP takes with the tables of its range
+     ([golden]), as SET_PAGE_DIRECTORY applies only to a space another owner
+     keeps (gvaspaceExternalRootDirCommit); its context is promoted whole. *)
   let* () =
     if client = priv_root then Ok ()
     else if cls = Defs.fermi_vaspace_a then
@@ -596,30 +752,43 @@ let alloc g ~client ~locate ~objects ~parent cls p =
                 ~entries:(root_entries g.p.chip)))
       in
       Ok ()
-    else if cls = compute_class then
-      let bufs = List.filter (fun (k, _) -> List.mem k [ 0; 1; 2 ]) g.buffers in
-      let* phys =
-        promote g ~client ~subdevice:objects.subdevice ~obj parent bufs
-          ~virt:(Some false) ~phys:None ()
-      in
-      let* _ =
-        promote g ~client ~subdevice:objects.subdevice ~obj parent bufs
-          ~have:phys ~virt:None ~phys:(Some false) ()
-      in
-      Ok ()
+    else if compute then bind ()
     else Ok ()
   in
   Ok obj
 
-(* A channel's work submit token carries its runlist in bits 31:16, and on
-   Blackwell bit 30 set. *)
-let token g obj p =
-  let module W = Defs.Work_submit_token in
-  let runlist = Option.value ~default:0 (Channels.find_opt obj g.channels) in
-  let blackwell = g.p.chip.family = Blackwell in
-  Rig_nv.set p W.work_submit_token
-    (Rig_nv.get p W.work_submit_token lor (runlist lsl 16)
-    lor if blackwell then 1 lsl 30 else 0)
+(* The work submit token of the channel [obj]. Beside a GSP, NVIDIA's RM
+   makes it from the channel's runlist and hardware id and asks the GSP
+   nothing (kchannelCtrlCmdGpfifoGetWorkSubmitToken_IMPL,
+   kfifoGenerateWorkSubmitTokenHal_GA100 and _GB202). *)
+let token g obj =
+  match Channels.find_opt obj g.channels with
+  | None -> Error (Rig_nv.Refused (strf "object 0x%x is no channel" obj))
+  | Some { runlist = None; _ } ->
+      Error
+        (Rig_nv.Refused "a channel of an engine the GPU lacks has no runlist")
+  | Some { id; runlist = Some runlist } ->
+      let runlist_doorbell = g.p.chip.family = Blackwell in
+      Ok (Rpc.work_submit_token ~runlist_doorbell ~runlist id)
+
+(* CUDA's boost of the GPU's clocks through [subdevice]: to their maximum, at
+   high priority, with no end (ctrl2080perf.h). NVIDIA's RM sends the GSP the
+   boost as the GSP's own command (kperfBoostSet_IMPL). *)
+let boost g ~client subdevice =
+  let flags =
+    put Defs.nv2080_ctrl_perf_boost_flags_cmd
+      Defs.nv2080_ctrl_perf_boost_flags_cmd_boost_to_max
+    lor put Defs.nv2080_ctrl_perf_boost_flags_cuda
+          Defs.nv2080_ctrl_perf_boost_flags_cuda_yes
+    lor put Defs.nv2080_ctrl_perf_boost_flags_cuda_priority
+          Defs.nv2080_ctrl_perf_boost_flags_cuda_priority_high
+  in
+  let duration = Defs.nv2080_ctrl_perf_boost_duration_infinite in
+  let r = Rpc.perf_boost ~flags ~duration in
+  let p = Rig_nv.params (String.length r) in
+  blit_params r p;
+  control g ~client subdevice Defs.nv2080_ctrl_cmd_internal_perf_boost_set_2x
+    (Some p)
 
 (* Frees [obj] of [client] and every object under it, as rpcRmApiFree_GSP
    does, whose status is the reply's result. A GPU that left the bus or
@@ -648,19 +817,31 @@ let free g ~client obj =
         memory);
   Ok ()
 
+(* A client's RM, which handles each command as NVIDIA's RM does beside a
+   GSP, from the flags of its exported method tables (g_*_nvoc.c) and the
+   command's handler: it answers some itself, translates others, and sends
+   the rest to the GSP as they are. *)
 let client_rm g ~client ~locate =
   let objects = { subdevice = 0 } in
+  let forward cmd obj p = control g ~client obj cmd (Some p) in
   {
     Rig_nv.release = 570;
     client;
     alloc =
       (fun ~parent cls p -> alloc g ~client ~locate ~objects ~parent cls p);
-    control =
-      (fun obj cmd p ->
-        let* () = control g ~client obj cmd p in
-        if cmd = Defs.nvc36f_ctrl_cmd_gpfifo_get_work_submit_token then
-          Option.iter (token g obj) p;
-        Ok ());
+    token = token g;
+    (* Its handler refuses a graphics channel whose context is not yet bound,
+       then sends the command as it is (kchangrpapiCtrlCmdGpFifoSchedule_IMPL,
+       kchannelIsSchedulable_IMPL). A client's compute context is bound when
+       its object is made ([alloc]), before any schedule. *)
+    schedule = forward Defs.nva06c_ctrl_cmd_gpfifo_schedule;
+    boost = boost g ~client;
+    (* Its method table marks it ROUTE_TO_PHYSICAL, which sends it to the GSP
+       as it is (rmresControl_Prologue_IMPL). *)
+    sm_errors = forward Defs.nv83de_ctrl_cmd_debug_read_all_sm_error_states;
+    (* Its handler sends the command as it is
+       (ksmdbgssnCtrlCmdDebugReadMMUFaultInfo_IMPL). *)
+    mmu_faults = forward Defs.nv83de_ctrl_cmd_debug_read_mmu_fault_info;
     free = Some (fun ~parent:_ obj -> free g ~client obj);
   }
 
@@ -721,10 +902,13 @@ let gpu g (rm : Rig_nv.rm) ~subdevice =
   let module L = Defs.Gr_info_list in
   let module I = Defs.Internal_gr_info in
   let p = Rig_nv.params S.sizeof in
+  (* An internal command, which NVIDIA's RM refuses from a client's control
+     and sends the GSP on a client of its own (kgraphicsLoadStaticInfo_KERNEL);
+     it goes here on the caller's client, as the GSP answers it there too. *)
   let* () =
     Result.map_error why
-      (rm.control subdevice Defs.nv2080_ctrl_cmd_internal_static_kgr_get_info
-         (Some p))
+      (control g ~client:rm.client subdevice
+         Defs.nv2080_ctrl_cmd_internal_static_kgr_get_info (Some p))
   in
   let info i =
     let engine = elt S.engine_info 0 (0, 0) in
@@ -747,10 +931,6 @@ let gpu g (rm : Rig_nv.rm) ~subdevice =
   | _ -> assert false (* five indices asked *)
 
 (* The golden context *)
-
-(* The GPU memory the GSP's internal address space reserves for its own page
-   directory entries: 512 MiB, whose tables the server copies. *)
-let reserved = 512 * mib
 
 (* The golden channel: 32 entries, its USERD 0x100 into its page, of the
    graphics engine, with the flags and internal flags CPU-RM gives the GSP's own
@@ -800,41 +980,29 @@ let golden g =
           Rig_nv.get t (elt T.entries i (elt E.engine_data k (0, 4)))
         in
         (data 2, data 3));
-  (* The reserved page directory entries. *)
-  let space = Page_table.space g.p.tables in
-  let* va =
-    match Space.alloc ~align:reserved space reserved with
-    | Some va -> Ok va
-    | None -> Error "no addresses for the GSP's page directory"
-  in
-  let* levels =
-    match on_tables g (fun t -> Page_table.tables t ~va reserved) with
+  (* The address space's tables, as NVIDIA's RM gives the GSP those of its
+     own spaces: the GSP takes over the tables of its range down to the dual
+     level, the root as the space's page directory, and maps its own buffers
+     there; the golden objects take addresses of the process's, which start
+     at 64 GiB, above that range. *)
+  let v = Mmu.version g.p.chip.family in
+  let first, _ = Rpc.reserved in
+  let dual = fst (List.nth (Page_entry.pages v) 1) in
+  let* tables =
+    match on_tables g (fun t -> Page_table.tables t ~va:first dual) with
     | Some l -> Ok l
-    | None -> Error "no GPU memory for the GSP's page directory"
+    | None -> Error "no GPU memory for the tables of the GSP's addresses"
   in
-  let module R = Defs.Reserved_pdes in
-  let r = Rig_nv.params R.sizeof in
-  Rig_nv.set r R.page_size reserved;
-  Rig_nv.set r R.num_levels_to_copy (List.length levels);
-  Rig_nv.set r R.virt_addr_lo va;
-  Rig_nv.set r R.virt_addr_hi (va + reserved - 1);
-  let shifts = List.rev (Page_entry.levels (Mmu.version g.p.chip.family)) in
-  List.iteri
-    (fun i table ->
-      let f x = elt R.levels i x in
-      Rig_nv.set r (f R.levels_phys_address) table;
-      Rig_nv.set r (f R.levels_size)
-        (if i = 0 then root_entries g.p.chip * 8 else page);
-      Rig_nv.set r (f R.levels_page_shift) (List.nth shifts i);
-      Rig_nv.set r (f R.levels_aperture) 1)
-    levels;
+  let r = Rpc.reserved_pdes v tables in
+  let p = Rig_nv.params (String.length r) in
+  blit_params r p;
   let* () =
     control vaspace Defs.nv90f1_ctrl_cmd_vaspace_copy_server_reserved_pdes
-      (Some r)
+      (Some p)
   in
   (* The channel. The golden context lives as long as the GSP, so its memory
-     is recorded for no object. *)
-  let* area = object_memory g ~client:priv_root 0 page in
+     is recorded for the GSP's own client, which the process never frees. *)
+  let* area = object_memory g ~client:priv_root priv_root page in
   let module G = Defs.Gpfifo_alloc in
   let gp = Rig_nv.params G.sizeof in
   Rig_nv.set gp G.gp_fifo_offset area.va;
@@ -859,11 +1027,13 @@ let golden g =
     control subdev
       Defs.nv2080_ctrl_cmd_internal_static_kgr_get_context_buffers_info (Some c)
   in
+  let field idx x =
+    Rig_nv.get c (elt C.engine_context_buffers_info 0 (elt Cb.engine idx x))
+  in
   let info ?(add = 0) ?align idx =
-    let f x =
-      Rig_nv.get c (elt C.engine_context_buffers_info 0 (elt Cb.engine idx x))
-    in
-    round_up (f B.size + add) (Option.value align ~default:(f B.alignment))
+    round_up
+      (field idx B.size + add)
+      (Option.value align ~default:(field idx B.alignment))
   in
   (* The graphics context and its patch buffer, then the global buffers from
      index 14 on of the engine's context properties, the fifth aligned to 2 MiB.
@@ -877,14 +1047,21 @@ let golden g =
       Defs
       .nv0080_ctrl_fifo_get_engine_context_properties_engine_id_graphics_patch
   in
+  (* A context in an address space another owner keeps has a PM buffer from
+     its start, of this size ([context]). *)
+  let pm =
+    let id =
+      Defs.nv0080_ctrl_fifo_get_engine_context_properties_engine_id_graphics_pm
+    in
+    if field id B.size = 0 then 0 else info id
+  in
   let global x =
     info ?align:(if x = 5 then Some (2 * mib) else None) (x + 14)
   in
-  let buf ?(local = false) ~phys ~virt size = { size; phys; virt; local } in
-  g.buffers <-
+  let buf ~phys ~virt size = { size; phys; virt } in
+  let buffers =
     [
       (0, buf graphics ~phys:true ~virt:true);
-      (1, buf patch ~phys:true ~virt:true ~local:true);
       (2, buf patch ~phys:true ~virt:true);
     ]
     @ List.map
@@ -894,13 +1071,34 @@ let golden g =
         (9, buf (global 9) ~phys:true ~virt:true);
         (10, buf (global 10) ~phys:true ~virt:false);
         (11, buf (global 10) ~phys:true ~virt:true);
-      ];
-  let* _ =
-    Result.map_error why
-      (promote g ~client:priv_root ~subdevice:subdev ~obj:0 channel
-         (List.filter (fun (_, b) -> not b.local) g.buffers)
-         ~virt:None ~phys:None ())
+      ]
   in
+  (* Each buffer's memory, mapped in the process's tables, and what the GSP is
+     told of it. The memory is zeroed: NVIDIA's RM takes these buffers from an
+     allocator that scrubs memory as it is freed (pmaFreePages), and nothing
+     states that the engine writes them before it reads them. *)
+  let given (id, b) =
+    let* m = object_memory g ~client:priv_root priv_root b.size in
+    let phys = if b.phys then Some (paddr m, b.size) else None in
+    let virt = if b.virt then Some m.va else None in
+    Ok ((id, m.va), { Rpc.buffer = id; phys; virt })
+  in
+  let rec give acc = function
+    | [] -> Ok (List.rev acc)
+    | x :: rest ->
+        let* y = given x in
+        give (y :: acc) rest
+  in
+  let* l = give [] buffers in
+  let* () =
+    Result.map_error why
+      (promote g ~client:priv_root ~subdevice:subdev ~channel
+         (List.map snd l))
+  in
+  (* Ids from 3 on are the GPU's global buffers, which every context maps; the
+     main (0) and patch (2) buffers are this context's own. *)
+  let globals = List.filter (fun (id, _) -> id > 2) (List.map fst l) in
+  g.graphics <- { main = graphics; pm; patch; globals };
   let* _ = alloc ~parent:channel compute_class None in
   let* _ = alloc ~parent:channel copy_class None in
   Ok ()
@@ -953,6 +1151,8 @@ let take p (fw : Images.t) fwsec ~taken =
   let* bootloader = sys ~contiguous:true fw.bootloader.image.length in
   blit fw.bootloader.image bootloader.w 0;
   let* meta = sys page in
+  let* flush = sys page in
+  let* flush = flush_registers c (first flush) in
   let wpr_meta =
     Fb_layout.wpr_meta (Chip.layout c.family) ~memory:p.memory
       ~gsp:{ address = first radix; size = fw.gsp.length }
@@ -966,8 +1166,23 @@ let take p (fw : Images.t) fwsec ~taken =
   (* The start, FWSEC set up for the GPU's memory. *)
   let* start =
     match (fw.start, fwsec, c.family) with
-    | `Booter b, Some f, (Ampere | Ada) ->
-        Ok (Legacy (Vbios.patch f ~frts:(Fb_layout.frts ~memory:p.memory), b))
+    | ( `Booter ({ load; unload } as booters : Images.booters),
+        Some (fwsec : Vbios.fwsec),
+        (Ampere | Ada) ) ->
+        let* fwsec_at = vram p (String.length fwsec.image) in
+        let larger =
+          Int.max (String.length load.image) (String.length unload.image)
+        in
+        let* booter_at = vram p larger in
+        Ok
+          (Legacy
+             {
+               fwsec;
+               frts = Fb_layout.frts ~memory:p.memory;
+               booters;
+               fwsec_at;
+               booter_at;
+             })
     | `Fmc m, None, Blackwell ->
         let* args = sys page in
         Window.write args.w 0
@@ -988,16 +1203,19 @@ let take p (fw : Images.t) fwsec ~taken =
       lock = Rig_nv.Lock.create ();
       libos = first libos;
       meta = first meta;
+      flush;
       start;
       fault = None;
+      reports = [];
       unanswered = false;
       sequencing = false;
       next = first_handle;
       clients = first_client;
       runlists = [];
+      groups = Channels.empty;
       channels = Channels.empty;
       held = Objects.empty;
-      buffers = [];
+      graphics = { main = 0; pm = 0; patch = 0; globals = [] };
       taken;
     }
 
@@ -1015,48 +1233,49 @@ let create p fw fwsec =
       give_back p taken;
       Printexc.raise_with_backtrace e bt
 
+(* A falcon's view of FWSEC at [pa], and of a booter at [pa]. *)
+let fwsec_hs pa (f : Vbios.fwsec) =
+  {
+    Falcon.image = pa;
+    code = { off = 0; pa = f.imem_pa; va = f.imem_va; size = f.imem_size };
+    data = { off = f.imem_size; pa = f.dmem_pa; va = 0; size = f.dmem_size };
+    pkc = f.pkc;
+    engines = f.engines;
+    ucode = f.ucode;
+  }
+
+let booter_hs pa (b : Images.booter) =
+  {
+    Falcon.image = pa;
+    code = { off = fst b.code; pa = 0; va = fst b.code; size = snd b.code };
+    data = { off = fst b.data; pa = 0; va = 0; size = snd b.data };
+    pkc = b.pkc;
+    engines = b.engines;
+    ucode = b.ucode;
+  }
+
 let falcons g =
   match g.start with
-  | Cot ops -> Ok ops
-  | Legacy (f, b) ->
-      let* fwsec_pa, fwsec_w = vram g.p (String.length f.image) in
-      Window.write fwsec_w 0 f.image;
-      let* booter_pa, booter_w = vram g.p (String.length b.image) in
-      Window.write booter_w 0 b.image;
-      let fwsec =
-        {
-          Falcon.image = fwsec_pa;
-          code = { off = 0; pa = f.imem_pa; va = f.imem_va; size = f.imem_size };
-          data =
-            { off = f.imem_size; pa = f.dmem_pa; va = 0; size = f.dmem_size };
-          pkc = f.pkc;
-          engines = f.engines;
-          ucode = f.ucode;
-        }
-      in
-      let booter =
-        {
-          Falcon.image = booter_pa;
-          code =
-            { off = fst b.code; pa = 0; va = fst b.code; size = snd b.code };
-          data = { off = fst b.data; pa = 0; va = 0; size = snd b.data };
-          pkc = b.pkc;
-          engines = b.engines;
-          ucode = b.ucode;
-        }
-      in
-      Ok (Falcon.legacy ~fwsec ~booter ~libos:g.libos ~wpr_meta:g.meta)
+  | Cot ops -> ops
+  | Legacy { fwsec; frts; booters = { load; _ }; fwsec_at; booter_at } ->
+      let f = Vbios.patch fwsec (Frts frts) in
+      Window.write fwsec_at.w 0 f.image;
+      Window.write booter_at.w 0 load.image;
+      Falcon.legacy
+        ~fwsec:(fwsec_hs fwsec_at.pa f)
+        ~booter:(booter_hs booter_at.pa load)
+        ~libos:g.libos ~wpr_meta:g.meta
 
 let boot g =
   let c = g.p.chip in
+  List.iter (fun (r, v) -> Chip.set c r v) g.flush;
   Function.set_bus_master c.fn true;
   (* What the GSP reads first, before it runs. *)
   let* () =
     send g Defs.nv_vgpu_msg_function_gsp_set_system_info (system_info g.p)
   in
   let* () = send g Defs.nv_vgpu_msg_function_set_registry (Rpc.registry keys) in
-  let* ops = falcons g in
-  let* () = Falcon.run c ops in
+  let* () = Falcon.run c (falcons g) in
   (* The GSP runs: its queue, its first answer, then the golden context. *)
   let* () =
     Function.wait c.fn ~us:(answer_ms * 1000) "the GSP's message queue"
@@ -1072,20 +1291,80 @@ let boot g =
       0;
   golden g
 
+(* Takes the boot down as NVIDIA's RM does once the GSP's firmware has
+   unloaded (kgspTeardown_TU102 on Ampere and Ada, kgspTeardown_GH100 on
+   Blackwell): NVIDIA's driver refuses to boot a GPU whose protected memory
+   (WPR2) is up (_kgspBootGspRm), and nouveau, nova-core and the RM each take it
+   down at their stop. As the RM does, a wait for the firmware's suspension
+   that runs out goes on, since the falcon's reset stops the GSP whatever it
+   runs, and so does a FWSEC-SB that fails: the unloading booter's own check
+   that WPR2 is down decides. An open finds WPR2 down before its boot, so only
+   this boot's FWSEC raised it. A boot whose FWSEC never set it up is left as
+   it is: of the RM's steps it skips only SB, which puts back the VBIOS's
+   applications, and an attach's reset reruns the GPU's own boot. *)
+let teardown g ~unloaded =
+  let c = g.p.chip in
+  let suspended () =
+    if unloaded then Falcon.run c (Falcon.suspended c.family) else Ok ()
+  in
+  match g.start with
+  | Cot _ -> suspended ()
+  | Legacy _ when not (Chip.booted c) -> Ok ()
+  | Legacy { fwsec; booters = { unload; _ }; fwsec_at; booter_at; _ } ->
+      ignore (suspended () : (unit, string) result);
+      let sb = Vbios.patch fwsec Sb in
+      Window.write fwsec_at.w 0 sb.image;
+      ignore
+        (Falcon.run c (Falcon.fwsec_sb (fwsec_hs fwsec_at.pa sb))
+          : (unit, string) result);
+      Window.write booter_at.w 0 unload.image;
+      Falcon.run c (Falcon.unload (booter_hs booter_at.pa unload))
+
+(* Gives back the addresses of the GPU memory the GSP still holds, its golden
+   context's included, to the space every GPU of the process shares. The
+   memory itself is the GPU's, whose tables no later open keeps. They are
+   taken out of [g] first, so an exception leaks them and frees none twice. *)
+let give_addresses g =
+  let held =
+    Rig_nv.Lock.protect g.lock (fun () ->
+        let h = g.held in
+        g.held <- Objects.empty;
+        h)
+  in
+  Objects.iter
+    (fun _ h ->
+      List.iter
+        (function Mapped m -> Space.free g.p.space m.va | Block _ -> ())
+        h.given)
+    held
+
 (* The GSP stops every channel, unless the GPU cannot be reached or the GSP
    left a call unanswered, which an unload would wait for in vain, or the GSP
    never set its queue up and so runs nothing an unload would stop. A fault an
-   event reported leaves the GSP answering, so its unload still runs. With its bus mastering off the GPU reaches
-   system memory no more, whatever its channels do, and the boot's memory goes
-   back. That write to the configuration space completes before it returns, so a
-   GPU that answers after it took it: one that does not may still read the
-   memory, which stays taken. The GSP runs on, and the next open resets it. *)
+   event reported leaves the GSP answering, so its unload still runs. The boot
+   is then taken down while the GPU still masters the bus, into memory that is
+   still the process's. With its bus mastering off the GPU reaches system
+   memory no more, whatever its channels do, and the boot's memory goes back.
+   That write to the configuration space completes before it returns, so a GPU
+   that answers after it took it: one that does not may still read the
+   memory, which stays taken. A GPU whose boot raised WPR2 ran: if its unload
+   did not stop its channels, or its teardown failed, it is lost, so that its
+   next open resets it before any boot. *)
 let stop g =
-  let answers () = Option.is_none (Function.failed g.p.chip.fn) in
-  if answers () && Msgq.ready g.q && not g.unanswered then ignore (unload g);
-  Function.set_bus_master g.p.chip.fn false;
+  let c = g.p.chip in
+  let answers () = Option.is_none (Function.failed c.fn) in
+  let ran = answers () && Chip.booted c in
+  let unloaded =
+    answers () && Msgq.ready g.q && (not g.unanswered)
+    && Result.is_ok (unload g)
+  in
+  let down = if answers () then teardown g ~unloaded else Ok () in
+  Function.set_bus_master c.fn false;
   if not (answers ()) then `Unknown
   else begin
     give_back g.p g.taken;
-    `Clean
+    give_addresses g;
+    match down with
+    | Ok () when unloaded || not ran -> `Clean
+    | Ok () | Error _ -> `Lost
   end

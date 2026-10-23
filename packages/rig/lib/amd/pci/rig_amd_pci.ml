@@ -83,6 +83,7 @@ let gpus =
   Driver.make ~name:"AMD-PCI" ~memory_bar:(Some 0) ~siblings:Remove
     ~nodes:(fun ~root:_ _ -> [])
     ~unreleased ~teardown_ms:30_000 ~reset:Boot.reset
+    ~ready:(fun _ -> Ok ())
     (fun (id : Machine.id) -> Amd.is_gpu ~vendor:id.vendor ~class_:id.class_)
 
 let buses ?(machine = Machine.this) () = Driver.buses gpus machine
@@ -172,13 +173,15 @@ let protect g f = Amd.Lock.protect g.lock f
 
 (* What the path keeps of each machine, from its first open there: the key
    its devices share, so that a GPU's number names the same GPU for each of
-   them, and each GPU's reach as its last open found it, by number. A GPU's
-   reach is the same at every open ([Memory.reach]), so a device's [reaches]
-   answers from its GPU's number alone, also once it is lost, and keeps nothing
-   of the device. *)
+   them, each GPU's reach as its last open found it, by number, and what its
+   boots keep, by bus. A GPU's reach is the same at every open
+   ([Memory.reach]), so a device's [reaches] answers from its GPU's number
+   alone, also once it is lost, and keeps nothing of the device. Each list
+   holds at most the machine's AMD GPUs. *)
 type known = {
   key : Memory.region Type.Id.t;
   mutable reached : (int * Memory.reach) list;
+  mutable kept : (string * Boot.kept) list;
 }
 
 let machines : (Machine.t * known) list ref = ref []
@@ -189,13 +192,24 @@ let known m =
   match List.assq_opt m !machines with
   | Some on -> on
   | None ->
-      let on = { key = Type.Id.make (); reached = [] } in
+      let on = { key = Type.Id.make (); reached = []; kept = [] } in
       machines := (m, on) :: !machines;
       on
 
 let learn on index reach =
   Amd.Lock.protect machines_lock @@ fun () ->
   on.reached <- (index, reach) :: List.remove_assoc index on.reached
+
+(* What the boots of the GPU at [bus] keep. Its opens run one at a time, under
+   the driver's lock. *)
+let kept on bus =
+  Amd.Lock.protect machines_lock @@ fun () ->
+  match List.assoc_opt bus on.kept with
+  | Some k -> k
+  | None ->
+      let k = Boot.kept () in
+      on.kept <- (bus, k) :: on.kept;
+      k
 
 let reaches on ~index j =
   let reach () =
@@ -241,6 +255,14 @@ let map_peer g fn (m : Memory.region Amd.memory) =
 
 let free g (m : Memory.region Amd.memory) =
   protect g (fun () -> Memory.free g.memory m.data)
+
+(* Another function reaches the memory as a peer GPU does, at its runs through
+   the memory BAR, and rig.pci keeps them and the GPU's function for it until
+   the process exits. *)
+let dma g (m : Memory.region Amd.memory) ~client =
+  Result.map
+    (fun runs -> Rig_edge.Bus runs)
+    (protect g (fun () -> Memory.bus g.memory m.data ~client))
 
 (* Opening *)
 
@@ -290,6 +312,8 @@ let path g h fn ~index : Memory.region Amd.path =
     reaches = reaches on ~index;
     map_peer = (fun m -> guard (fun () -> map_peer mem fn m));
     free = (fun m -> guard (fun () -> free mem m));
+    bus = Some (Rig_pci.Function.bus fn);
+    dma = (fun m ~fn:client -> dma mem m ~client);
     queue =
       (fun kind ~ring ~bytes ~read ~write ->
         guard (fun () -> Boot.queue g kind ~ring ~bytes ~read ~write));
@@ -298,7 +322,8 @@ let path g h fn ~index : Memory.region Amd.path =
     hdp = Boot.hdp g;
     interrupt;
     hang_ms = Some Driver.hang_ms;
-    sleep = (fun ~ms -> guard (fun () -> Boot.sleep g ~ms));
+    interrupts = (fun () -> Boot.interrupts g);
+    sleep = (fun ~ms ~after -> guard (fun () -> Boot.sleep g ~ms ~after));
     stable_power = (fun () -> guard (fun () -> Boot.stable_power g));
     stop;
   }
@@ -315,7 +340,9 @@ let boot h fn ~firmware =
     let* _, loads = survey ~firmware d in
     loads
   in
-  match Boot.start ~gpus fn first with
+  let on = known (Rig_pci.Function.machine fn) in
+  let kept = kept on (Rig_pci.Function.bus fn) in
+  match Boot.start ~gpus ~kept fn first with
   | Ok g -> Ok g
   | Error (`Refused why) -> Error (`Refused why)
   | Error `Running -> Error `Running

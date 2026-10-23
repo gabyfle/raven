@@ -307,7 +307,7 @@ let trips =
 (* host -> a -> b -> host, three copies of one submission that follow each
    other by their memory, is the identity. *)
 let copies (module G : Gpu) (ka, kb, n, (oa, ob)) =
-  G.with_ @@ fun t ->
+  G.with_shared @@ fun t ->
   if (G.D.facts t.g).copy_engine = None then
     skip ~reason:"the device has no copy engine" ();
   let at memory o = B.view (B.create ~memory t.d (n + o)) ~first:o ~length:n in
@@ -333,19 +333,21 @@ let copies (module G : Gpu) (ka, kb, n, (oa, ob)) =
   Rig.Point.wait v;
   equal octets data (get dst)
 
-(* A profile records a copy per copy part, from the device of the allocation its
-   bytes leave to the one they reach, with its bytes and the times of its
-   submission's span where the device times its work. A borrow of host memory
-   names the host. *)
+(* A profile records a copy per copy part, from the device in whose budget the
+   memory its bytes leave counts to the one they reach, with its bytes and the
+   times of its submission's span where the device times its work. A borrow of
+   host memory names the host; [Pinned] memory names the device only where the
+   host addresses the device's memory, and the host elsewhere. *)
 let profiled_copies (module G : Gpu) () =
   G.with_ @@ fun t ->
   if (G.D.facts t.g).copy_engine = None then
     skip ~reason:"the device has no copy engine" ();
   let n = 4096 in
+  let pinned = if Rig.reaches Rig.host t.d then t.d else Rig.host in
   let src, from =
     match borrowed t.d n with
     | Some b -> (b, Rig.host)
-    | None -> (filled ~memory:Pinned t.d (pattern n 1), t.d)
+    | None -> (filled ~memory:Pinned t.d (pattern n 1), pinned)
   in
   let a = B.create t.d n and b = B.create ~memory:Pinned t.d n in
   let (), events =
@@ -364,7 +366,7 @@ let profiled_copies (module G : Gpu) () =
   in
   equal
     (list (triple string string int))
-    [ (Rig.name from, Rig.name t.d, n); (Rig.name t.d, Rig.name t.d, n) ]
+    [ (Rig.name from, Rig.name t.d, n); (Rig.name t.d, Rig.name pinned, n) ]
     (List.map (fun (s, d, n, _, _) -> (Rig.name s, Rig.name d, n)) copies);
   let span =
     List.find_map
@@ -437,7 +439,7 @@ let chains (module G : Gpu) (kinds, links) =
   cover "an empty copy between two others"
     (List.exists Fun.id
        (List.mapi (fun i l -> i > 0 && i < last && l.n = 0) links));
-  G.with_ @@ fun t ->
+  G.with_shared @@ fun t ->
   if (G.D.facts t.g).copy_engine = None then
     skip ~reason:"the device has no copy engine" ();
   let capacity k =
@@ -504,7 +506,7 @@ let accesses =
    round over one memory. The host writes and reads through rig; a copy runs
    where a queue runs one, work otherwise. *)
 let readers (module G : Gpu) (place, writer, reader, same) =
-  G.with_ @@ fun t ->
+  G.with_shared @@ fun t ->
   let n = 16384 in
   let mem =
     match place with
@@ -573,7 +575,7 @@ let blit_cases =
 (* Blits and a fill of memory beside work on it that starts 50 ms late: each
    follows the work before it, and the work after it reads what it wrote. *)
 let blits (module G : Gpu) (memory, n) =
-  G.with_ @@ fun t ->
+  G.with_shared @@ fun t ->
   let late = 50_000_000 in
   let mem = B.create ~memory t.d n in
   let read_late o =
@@ -692,7 +694,7 @@ let edge_boxes (module G : Gpu) b =
     (b.slack = 0 && rows > 0 && width > 0);
   cover "Device memory on both sides, rows apart"
     (sm = Device && dm = Device && rows > 1 && (sp > 0 || dp > 0));
-  G.with_driver @@ fun g ->
+  G.with_shared_driver @@ fun g ->
   if (G.D.facts g).copy_engine = None then
     skip ~reason:"the device has no copy engine" ();
   let module E = Rig_gpu_support.Edge (G.D) in
@@ -725,12 +727,23 @@ let edge_boxes (module G : Gpu) b =
   done;
   equal octets (Bytes.to_string model) (E.read e dst ~at:0 nd)
 
-(* A fill of [n] bytes at [offset] into memory of a kind, [slack] bytes
-   before its end. *)
-type fill = { memory : Rig_edge.memory; offset : int; n : int; slack : int }
+(* A fill of [n] bytes of [byte] at [offset] into memory of a kind, [slack]
+   bytes before its end. *)
+type fill = {
+  memory : Rig_edge.memory;
+  offset : int;
+  n : int;
+  slack : int;
+  byte : char;
+}
+
+(* The bytes a fill writes: 0, each side of the high bit, the top, and one
+   whose 32-bit word holds no zero byte. *)
+let fill_bytes = [| '\x00'; '\x7f'; '\x80'; '\xff'; 'f' |]
 
 (* Fills of no bytes, one to seven bytes and their ends, and larger fills
-   with a body of four-byte words and unaligned ends. *)
+   with a body of four-byte words and unaligned ends, of each byte of
+   [fill_bytes]. *)
 let fills =
   let open Gen in
   let n =
@@ -744,23 +757,25 @@ let fills =
   in
   with_pp
     (fun ppf f ->
-      Format.fprintf ppf "%d bytes of %a at %d, slack %d" f.n pp_edge_memory
-        f.memory f.offset f.slack)
+      Format.fprintf ppf "%d bytes %C of %a at %d, slack %d" f.n f.byte
+        pp_edge_memory f.memory f.offset f.slack)
     (let+ memory = edge_memory
      and+ offset = int_range 0 7
      and+ n = n
-     and+ slack = frequency [ (1, constant 0); (2, int_range 1 7) ] in
-     { memory; offset; n; slack })
+     and+ slack = frequency [ (1, constant 0); (2, int_range 1 7) ]
+     and+ byte = of_list ~pp:Format.pp_print_char (Array.to_list fill_bytes) in
+     { memory; offset; n; slack; byte })
 
 (* A fill part sets each byte of its row to its byte, and writes no other. *)
 let edge_fills (module G : Gpu) f =
   cover "a fill of no bytes" (f.n = 0);
   cover "a fill of fewer than 8 bytes" (f.n > 0 && f.n < 8);
+  cover "a byte with its high bit set" (f.n > 0 && Char.code f.byte >= 0x80);
   cover "an unaligned start" (f.n > 0 && f.offset land 3 <> 0);
   cover "an unaligned end" (f.n > 0 && (f.offset + f.n) land 3 <> 0);
   cover "a body of words" (f.n >= 8);
   cover "the fill ends its memory" (f.slack = 0 && f.n > 0);
-  G.with_driver @@ fun g ->
+  G.with_shared_driver @@ fun g ->
   if (G.D.facts g).copy_engine = None then
     skip ~reason:"the device has no copy engine" ();
   let module E = Rig_gpu_support.Edge (G.D) in
@@ -780,10 +795,10 @@ let edge_fills (module G : Gpu) f =
       rows = 1;
       src_pitch = 0;
       dst_pitch = f.n;
-      fill = Some 'f';
+      fill = Some f.byte;
     };
   let model = Bytes.of_string before in
-  Bytes.fill model f.offset f.n 'f';
+  Bytes.fill model f.offset f.n f.byte;
   equal octets (Bytes.to_string model) (E.read e dst ~at:0 size)
 
 (* [Buffer.fill] sets each byte of its view, on any memory, and no other. *)
@@ -791,13 +806,37 @@ let buffer_fills (module G : Gpu) ((memory : B.kind), f) =
   cover "a fill of no bytes" (f.n = 0);
   cover "an unaligned view" (f.n > 0 && f.offset land 3 <> 0);
   cover "Device memory" (memory = Device && f.n > 0);
-  G.with_ @@ fun t ->
+  cover "a byte with its high bit set" (f.n > 0 && Char.code f.byte >= 0x80);
+  G.with_shared @@ fun t ->
   let size = f.offset + f.n + f.slack in
   let b = filled ~memory t.d (pattern size 4) in
-  B.fill (B.view b ~first:f.offset ~length:f.n) 'f';
+  B.fill (B.view b ~first:f.offset ~length:f.n) f.byte;
   let model = Bytes.of_string (pattern size 4) in
-  Bytes.fill model f.offset f.n 'f';
+  Bytes.fill model f.offset f.n f.byte;
   equal octets (Bytes.to_string model) (get b)
+
+(* [Buffer.fill] of Device memory past 256 KiB, which a driver may run as a
+   kernel of 16-byte stores, sets each byte of its view and no other: from
+   each byte after a 16-byte boundary, ending on each, with each byte of
+   [fill_bytes] in turn. *)
+let large_fills (module G : Gpu) () =
+  G.with_ @@ fun t ->
+  let n = 256 lsl 10 and slack = 19 in
+  let size = 15 + n + 17 + slack in
+  let b = B.create t.d size in
+  for offset = 0 to 15 do
+    List.iter
+      (fun length ->
+        let c = fill_bytes.((offset + length) mod Array.length fill_bytes) in
+        put b (pattern size offset);
+        B.fill (B.view b ~first:offset ~length) c;
+        let model = Bytes.of_string (pattern size offset) in
+        Bytes.fill model offset length c;
+        equal octets
+          ~msg:(strf "%d bytes %C at %d" length c offset)
+          (Bytes.to_string model) (get b))
+      [ n; n + 17 ]
+  done
 
 (* Device order *)
 
@@ -1106,7 +1145,7 @@ let launches_conform (module G : Gpu) =
     cover "threads along y or z" (ty > 1 || tz > 1);
     cover "a view at an offset" (g.first > 0);
     cover "a ref at an offset" (g.offset > 0);
-    G.with_ @@ fun t ->
+    G.with_shared @@ fun t ->
     let l = launches_on launcher t in
     let n = gx * gy * gz * tx * ty * tz in
     let bytes = g.offset + (4 * n) in
@@ -1352,7 +1391,7 @@ let launch_order (module G : Gpu) =
 let launches = Gen.list ~size:(Gen.int_range 1 12) (Gen.int_range 1 4)
 
 let workspace (module G : Gpu) sizes =
-  G.with_ @@ fun t ->
+  G.with_shared @@ fun t ->
   let s = B.create t.d (4 * 1024) in
   let f = G.D.facts t.g in
   let into ~dst ~src =
@@ -1407,8 +1446,11 @@ let idle_close (module G : Gpu) () =
    once it is Stopped. The law bounds the heaps, which a mapping a kernel
    driver holds is not in. A warm run of as many opens fills the caches and
    tables the opens grow to, and each closed device's memory returns at its
-   [free_cache]. *)
-let opens = 32
+   [free_cache]. The bound is per open, so a leak past it fails at any
+   count; the count sets the room left to a cache the warm run did not fill,
+   eight times what each open keeps below its bound. Over PCI each open boots
+   the GPU's GSP, in about 3.6 s: the 16 opens take a minute. *)
+let opens = 8
 
 (* What an open keeps of the C heap past its close, per device, a baseline
    measured on each driver's machine: rig's records, about 1 KiB, the
@@ -2005,6 +2047,8 @@ let laws (module G : Gpu) =
       prop ~count:60 "a fill sets each byte of its view, and no other"
         (Gen.pair memory fills)
         (buffer_fills g);
+      test "a fill past 256 KiB sets each byte of its view, and no other"
+        (large_fills g);
       test "a value's work starts once every earlier value's completed"
         (device_order g);
       test "a profile around a submission records a span that bounds its work"

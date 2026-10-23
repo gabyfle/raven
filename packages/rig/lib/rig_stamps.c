@@ -358,6 +358,21 @@ value caml_rig_sub_copy(value v_s, value v_k, value v_i, value v_src,
   c->part = Int_val(v_i);
   c->src = Int_val(v_src);
   c->dst = Int_val(v_dst);
+  c->boxed = 0;
+  return Val_unit;
+}
+
+/* The submission's [v_k]th copy is the box [v_box], a Def.box whose fields
+   C reads in order, between its two buffers. */
+value caml_rig_sub_box(value v_s, value v_k, value v_box) {
+  struct rig_copy *c = &Sub_val(v_s)->copies[Int_val(v_k)];
+  c->boxed = 1;
+  c->box.src_offset = (uint64_t)Long_val(Field(v_box, 0));
+  c->box.dst_offset = (uint64_t)Long_val(Field(v_box, 1));
+  c->box.width = (uint64_t)Long_val(Field(v_box, 2));
+  c->box.rows = (uint64_t)Long_val(Field(v_box, 3));
+  c->box.src_pitch = (uint64_t)Long_val(Field(v_box, 4));
+  c->box.dst_pitch = (uint64_t)Long_val(Field(v_box, 5));
   return Val_unit;
 }
 
@@ -415,12 +430,21 @@ static void set_copy(struct rig_part *p, const struct rig_copy *c,
     return;
   }
   p->copy.dst = dst->handle;
-  p->copy.dst_offset = dst->offset;
   p->copy.src = src->handle;
-  p->copy.src_offset = src->offset;
-  p->copy.width = src->bytes;
-  p->copy.rows = 1;
-  p->copy.src_pitch = p->copy.dst_pitch = src->bytes;
+  if (c->boxed) {
+    p->copy.dst_offset = dst->offset + c->box.dst_offset;
+    p->copy.src_offset = src->offset + c->box.src_offset;
+    p->copy.width = c->box.width;
+    p->copy.rows = c->box.rows;
+    p->copy.src_pitch = c->box.src_pitch;
+    p->copy.dst_pitch = c->box.dst_pitch;
+  } else {
+    p->copy.dst_offset = dst->offset;
+    p->copy.src_offset = src->offset;
+    p->copy.width = src->bytes;
+    p->copy.rows = 1;
+    p->copy.src_pitch = p->copy.dst_pitch = src->bytes;
+  }
   p->copy.local = src->local   ? RIG_LOCAL_SRC
                   : dst->local ? RIG_LOCAL_DST
                                : RIG_LOCAL_NONE;
@@ -519,9 +543,15 @@ value caml_rig_sub_fill_byte(value *argv, int argn) {
 value caml_rig_sub_id(value v_s) { return Val_long((intnat)Sub_val(v_s)->id); }
 
 /* Fixed buffer [v_k]: the stamps of a memory a part names and how the
-   part uses it, an rig_use. */
+   part uses it, an rig_use. [v_k] lies among the buffers counted at
+   [caml_rig_sub_new]. */
 value caml_rig_sub_fixed(value v_s, value v_k, value v_stamps, value v_use) {
-  struct rig_fixed *f = &Sub_val(v_s)->fixed[Int_val(v_k)];
+  struct rig_sub *s = Sub_val(v_s);
+  intnat k = Long_val(v_k);
+  if (k < 0 || k >= s->nfixed)
+    caml_invalid_argument(
+        "Rig.Submission.make: a fixed buffer past those counted");
+  struct rig_fixed *f = &s->fixed[k];
   f->stamps = Stamps_val(v_stamps);
   f->use = (enum rig_use)Int_val(v_use);
   return Val_unit;
@@ -666,12 +696,16 @@ static struct rig_call *call_take(const struct rig_sub *s) {
 value caml_rig_submit_begin(value v_r, value v_s) {
   struct rig_run *r = Run_val(v_r);
   if (r->nargs > 0) {
-    intptr_t seen = rig_thread_number();
-    if (!atomic_compare_exchange_strong(&r->state, &seen, RUN_SUBMITTING)) {
-      if (seen != RUN_FREE) return Val_long(seen == RUN_SUBMITTING ? -2 : -1);
-      if (!atomic_compare_exchange_strong(&r->state, &seen, RUN_SUBMITTING))
-        return Val_long(seen == RUN_SUBMITTING ? -2 : -1);
-    }
+    intptr_t me = rig_thread_number();
+    intptr_t seen = atomic_load_explicit(&r->state, memory_order_relaxed);
+    /* A run the calling thread took moves only by this thread, which runs
+       no OCaml here, so a store moves it on; a free run, which another
+       thread may take meanwhile, moves by a compare-and-set. */
+    if (seen == me)
+      atomic_store_explicit(&r->state, RUN_SUBMITTING, memory_order_relaxed);
+    else if (seen != RUN_FREE ||
+             !atomic_compare_exchange_strong(&r->state, &seen, RUN_SUBMITTING))
+      return Val_long(seen == RUN_SUBMITTING ? -2 : -1);
   }
   struct rig_call *c = call_take(Sub_val(v_s));
   if (c == NULL) {
@@ -717,8 +751,8 @@ value caml_rig_call_side(value v_c, value v_k, value v_b, value v_local,
 }
 
 /* Sets the call's parts from [s]'s, the fields of each copy with a slot end
-   from the sides of its ends, or refuses a copy whose buffers differ in
-   size, overlap, or are both this process's memory. */
+   from the sides of its ends, or refuses a copy whose buffers overlap or are
+   both this process's memory, or, other than a box, differ in size. */
 static void set_copies(const struct rig_sub *s, struct rig_call *r) {
   memcpy(r->parts, s->parts, (size_t)s->nparts * sizeof *r->parts);
   for (int k = 0; k < s->ncopies; k++) {
@@ -733,7 +767,7 @@ static void set_copies(const struct rig_sub *s, struct rig_call *r) {
       set_copy(&r->parts[c->part], c, src, dst);
       continue;
     }
-    if (src->bytes != dst->bytes)
+    if (!c->boxed && src->bytes != dst->bytes)
       caml_invalid_argument("Rig.submit: a copy's buffers differ in size");
     if (rig_sides_overlap(src, dst))
       caml_invalid_argument("Rig.submit: a copy's buffers overlap");

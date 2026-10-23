@@ -79,7 +79,9 @@ val take : Machine.t -> string -> (t, string) result
     the memory files that dead processes left and no function reaches.
 
     [Error why] if [bus] is not a function of [m], if [m] has failed, if a
-    process, this one included, holds it, or if neither way is open:
+    process, this one included, holds it, if this process gave the memory
+    its BAR reaches to another function ({!Memory.bus}), until the process
+    exits, or if neither way is open:
     - it is bound to a driver other than [vfio-pci] ({!Driver.detach});
     - the IOMMU translates its addresses and it is not bound to [vfio-pci];
     - not behind an IOMMU, it is disabled, or it shares its device with
@@ -102,7 +104,12 @@ val release : t -> unit
     its DMA, and restores the legacy interrupts {!take} turned off. It unmaps
     [f]'s BAR windows, closes the process's files for [f] and unlocks it.
     Memory from {!alloc_dma} stays until {!free_dma}. Releasing again does
-    nothing.
+    nothing. An exception that ends a release part-way, such as an
+    asynchronous one ({!Sys.Break}), leaves what the release had not given back
+    to the process's exit, which leaves [f] at worst as a killed process leaves
+    a function it holds. Until a release returns, {!free_dma} and {!unpin} give
+    no memory back: [f] may still reach it, and it stays the process's until
+    the process exits.
 
     Behind an IOMMU, Linux turns bus mastering off when the last descriptor of
     the function's files closes. A child of [fork] that has not run [exec]
@@ -119,7 +126,7 @@ val addressing : t -> Machine.addressing
 (** [addressing f] is how [f] reaches system memory. *)
 
 val released : t -> bool
-(** [released f] is [true] iff {!release} gave [f] back. *)
+(** [released f] is [true] iff {!release} began giving [f] back. *)
 
 val failed : t -> string option
 (** [failed f] is why [f] can no longer be reached, if it cannot: its machine
@@ -166,7 +173,8 @@ val set_bus_master : t -> bool -> unit
     function when it returns. A write the system refuses is dropped.
 
     Each access raises [Invalid_argument] if its bytes are not in the
-    configuration space or the function was released, and nothing else. *)
+    configuration space or the function was released. An error the system gives
+    only for a bug in this library raises [Failure], naming it. *)
 
 val config8 : t -> int -> int
 (** [config8 f off] is the byte at [off] of [f]'s configuration space. *)
@@ -215,7 +223,10 @@ val map :
     physically. Elsewhere it is the window [~combine:false] makes. Map
     registers and doorbells with [~combine:false]. Without [combine], the
     window maps BAR [i] as its live windows do, or with [~combine:false] if it
-    has none.
+    has none. A window mapped into the process on a BAR whose register marks
+    it prefetchable, memory into which host bridges may merge the processor's
+    writes (PCI Local Bus Specification 2.2, 6.2.5.1), takes copies wider than
+    a word, whatever [combine] ({!Window.accesses}).
 
     [Error why] if VFIO or the kernel does not let the process map the BAR, or
     if [f] is taken physically and the file of its BAR [i] is shorter than the
@@ -349,7 +360,9 @@ val alloc_dma :
     than a page on a function taken physically. *)
 
 val free_dma : t -> Window.t -> unit
-(** [free_dma f w] frees [w], and [f] reaches it no more.
+(** [free_dma f w] frees [w], and [f] reaches it no more. Once a release of
+    [f] began and until it returned, [w] stays the process's until it exits
+    instead ({!release}).
 
     Raises [Invalid_argument] if [w] is not a live window {!alloc_dma} returned
     for [f]. *)
@@ -379,7 +392,9 @@ val pin : t -> int -> int -> ((int * int) list option, string) result
     Raises [Invalid_argument] if [a] is not on a page or [n <= 0]. *)
 
 val unpin : t -> int -> int -> unit
-(** [unpin f a n] releases one pin of the [n] bytes at [a].
+(** [unpin f a n] releases one pin of the [n] bytes at [a]. Once a release of
+    [f] began and until it returned, the memory stays locked until the process
+    exits instead ({!release}).
 
     Raises [Invalid_argument] if [(a, n)] is not pinned for [f]. *)
 
@@ -400,6 +415,16 @@ val set_own_length : int -> int
 (* [inherited f] is the [inherited] of [f]'s take ({!Machine.fn}) until
    {!forget} returns [Ok ()], and [false] after. *)
 val inherited : t -> bool
+
+(* [keep f] keeps [f] taken until the process exits, since another function
+   may write the memory its BAR reaches ({!Memory.bus}): from then on
+   {!release} turns [f]'s bus mastering off and gives back nothing else, and
+   {!take} of [f]'s bus on its machine, in this process or a child of fork,
+   is [Error]. The process's exit gives [f] back as it gives back every
+   function it holds. Keeping it again does nothing.
+
+   Raises [Invalid_argument] if [f] was released. *)
+val keep : t -> unit
 
 (* [forget f] is the [forget] of [f]'s take ({!Machine.fn}). The memory this
    process allocated stays listed for [f], so that the process's own death

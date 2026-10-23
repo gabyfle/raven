@@ -10,6 +10,49 @@ val opened : 'a Rig_edge.opener -> ('a, string) result
 (** [opened o] is [o.make] given a {!Host.word}: the device opened outside
     rig, for a test that calls its driver itself. *)
 
+(** {1:dmabufs Dma-bufs} *)
+
+(** The dma-bufs a driver exports ({!Rig.Buffer.dma}), by descriptor. *)
+module Dmabuf : sig
+  val size : int -> int option
+  (** [size fd] is the bytes of the dma-buf open as [fd], from Linux's
+      [/proc/self/fdinfo/FD], or [None] if no exporter is named there
+      ([exp_name]), as for a descriptor that is no dma-buf. *)
+
+  val read : int -> at:int -> int -> string option
+  (** [read fd ~at n] is the [n] bytes from byte [at] of the dma-buf [fd],
+      read through a mapping of it inside [DMA_BUF_IOCTL_SYNC]'s start and
+      end, or [None] if its exporter maps none, or off Linux. *)
+
+  val cloexec : int -> bool
+  (** [cloexec fd] is [true] iff [fd] closes on [exec]. *)
+
+  val close : int -> unit
+  (** [close fd] closes [fd]. *)
+end
+
+val bar_bytes : string -> bar:int -> (int * int) list -> int -> string
+(** [bar_bytes bus ~bar runs n] is the first [n] bytes at the bus ranges
+    [runs], as (address, bytes), of BAR [bar] of the function at [bus],
+    read through mappings of its [resourceN] file under [/sys/bus/pci],
+    which root may read. Each range lies in the BAR, at its bus address.
+
+    Raises [Unix.Unix_error] if the file cannot be mapped. *)
+
+val has : sub:string -> string -> bool
+(** [has ~sub s] is [true] iff [sub] occurs in [s]. *)
+
+val child : string -> unit
+(** [child flag] runs this executable again with the one argument [flag]. A
+    suite runs a test in a child where the test leaves its process changed
+    for good, as an export of a GPU's memory over PCI does. The test fails
+    unless the child exits with [0], and skips for the reason the child
+    gives if the child ends with {!skipped}. *)
+
+val skipped : string -> 'a
+(** [skipped why] ends this process, a child {!child} runs, as a skip of the
+    test for [why]. *)
+
 (** {1:host Host memory} *)
 
 (** Host memory the suites own, by address. *)
@@ -188,6 +231,17 @@ module type S = sig
   val with_driver : (gpu -> 'a) -> 'a
   (** [with_driver f] is [f g], [g] {!driver}[ ()], stopped after [f] returns or
       raises. *)
+
+  val with_shared : (t -> 'a) -> 'a
+  (** [with_shared f] is [f t], [t] the GPU the last [with_shared] opened if
+      nothing opened since, else a new {!open_}. [t] stays open after [f]
+      returns, until the next open or {!release}, and is closed if [f]
+      raises. A property's cases share one open this way, which a GPU whose
+      open boots its firmware for seconds needs. *)
+
+  val with_shared_driver : (gpu -> 'a) -> 'a
+  (** [with_shared_driver f] is {!with_shared} for the GPU opened by its driver
+      alone, as {!with_driver} opens it. *)
 
   val release : unit -> unit
   (** [release ()] ends what the last {!open_} or {!driver} made, if a failed

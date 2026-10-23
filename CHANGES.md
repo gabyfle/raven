@@ -1548,6 +1548,16 @@ thread.
 
 ### Tolk (new)
 
+- `Compiler_cuda.nvrtc` compiles in processes of its own, which serve compiles
+  in turn, so a source that crashes NVRTC 13.3 or 13.4's assembler raises
+  `Compile_error` naming the signal, which a search skips, where it ended the
+  program. NVRTC's own cache of binaries is disabled there: its key ignores
+  `--use_fast_math`, `-I` and other options, so it could serve a binary built
+  under others.
+- `Tolk_engine.link` links a copy between a GPU and the host whose offset
+  into storage made at link depends on the run's values, or whose offset into
+  an input moves with a range's trips, which raised. Such a copy is a move of
+  the program (`Rig_program.Move`), which takes offsets each step computes.
 - A kernel reducing over a variable size computes the reduction's identity
   where the size is 0. A sum read its accumulator unwritten; over a value the
   range does not change, a sum of an infinity was NaN and a maximum the value.

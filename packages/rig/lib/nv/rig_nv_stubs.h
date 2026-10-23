@@ -122,6 +122,8 @@ enum {
   V_BANK0,  /* the address of its constant bank 0 */
   V_NEXT,   /* the address of the descriptor it chains */
   V_SHARED, /* its dynamic shared memory, in bytes, a multiple of 128 */
+  V_WORD,   /* the address its release writes */
+  V_VALUE,  /* the value its release writes */
   VALUES
 };
 
@@ -133,6 +135,9 @@ struct launch {
   /* [qmd[s][c]]: without (s = 0) or with dynamic shared memory, chaining
      no descriptor (c = 0) or the one at V_NEXT */
   struct template qmd[2][2];
+  /* [released[s]]: qmd[s][0], which also writes V_VALUE at V_WORD as its
+     launch completes */
+  struct template released[2];
   struct template bank0;
   /* where the kernel's parameters start in bank 0, how many it reads, and
      the bank's bytes the descriptor names, which hold them */
@@ -347,8 +352,9 @@ struct device {
   _Atomic uint64_t local;
   /* whether the compute caches are owed an invalidation */
   _Atomic int invalidate;
-  /* The driver's byte-copy kernel; owned until confirmed channel stop. */
-  struct launch *copy_launch;
+  /* The driver's byte-copy and fill kernels; owned until confirmed channel
+     stop. */
+  struct launch *copy_launch, *fill_launch;
   /* The rings a growth made, which the next room that needs them installs,
      and the rings installed, NULL for those the device opened with: each
      channel's segment ring, then COMPUTE's launch ring. A room retires the

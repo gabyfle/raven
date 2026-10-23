@@ -47,7 +47,7 @@ let name = "AMD-PCI"
 let gpus ?(reset = counted) ?(nodes = no_nodes) ?(unreleased = released)
     ?(teardown_ms = teardown_ms) ?(siblings = Driver.Remove) () =
   Driver.make ~name ~memory_bar:(Some 0) ~siblings ~nodes ~unreleased
-    ~teardown_ms ~reset is_gpu
+    ~teardown_ms ~reset ~ready:(fun _ -> Ok ()) is_gpu
 
 let pp_progress ppf (d : Driver.progress) =
   match d with
@@ -467,7 +467,7 @@ let test_this_none () =
   let g =
     Driver.make ~name ~memory_bar:(Some 0) ~siblings:Remove
       ~nodes:no_nodes ~unreleased:released
-      ~teardown_ms ~reset:counted (fun _ -> false)
+      ~teardown_ms ~reset:counted ~ready:(fun _ -> Ok ()) (fun _ -> false)
   in
   let this = Machine.this in
   equal (result (list string) string) (Ok []) (Driver.buses g this);
@@ -970,18 +970,18 @@ let changes =
         ("drivers_probe", "");
         (devices gpu_bus "driver_override", "(null)");
       ] );
-    ( "attach gives the other functions of the GPU's device on vfio-pci back \
-       to their drivers",
+    ( "attach unbinds vfio-pci from the other functions of the GPU's device, \
+       refused while it stays bound",
       [
         Tree.gpu ~driver:"amdgpu" gpu_bus;
         { (audio "0000:03:00.1") with driver = Some "vfio-pci" };
       ],
       `Attach,
-      `Done,
+      `Refused "the driver vfio-pci stays bound to 0000:03:00.1",
       [
         ("drivers/vfio-pci/unbind", "0000:03:00.1");
-        (devices "0000:03:00.1" "driver_override", "");
-        ("drivers_probe", "0000:03:00.1");
+        (devices "0000:03:00.1" "driver_override", "vfio-pci");
+        ("drivers_probe", "");
       ] );
     ( "attach leaves a GPU on vfio-pci whose function cannot be taken as it was",
       [ Tree.gpu ~driver:"vfio-pci" gpu_bus ],
@@ -1539,6 +1539,180 @@ let test_keep_siblings () =
   equal ~msg:"the other function, kept" string ""
     (pci_file own (devices "0000:03:00.1" "remove"))
 
+(* A device's other functions under a kernel
+
+   A GPU's kernel driver may read the data of its device's other functions'
+   drivers as its own: NVIDIA's reads an audio function's as a sound card. So
+   with [Remove], no other function of the GPU's device is on vfio-pci while
+   the GPU's kernel driver is bound, during its probe and its unbind too. The
+   tree's kernel acts on what a change writes and records, at each bind and
+   unbind, the drivers of the device's other functions. *)
+
+let vfio = "vfio-pci"
+let audio_bus = "0000:03:00.1"
+let own_drivers = [ (gpu_bus, "amdgpu"); (audio_bus, "snd_hda_intel") ]
+let on_kernel_driver = function Some d -> d <> vfio | None -> false
+
+(* The binds and unbinds of [events] that break the rule: the GPU's kernel
+   driver's while another function is on vfio-pci, and another function's
+   bind to vfio-pci while the GPU's kernel driver is bound. *)
+let broken events =
+  List.filter
+    (fun (e : Tree.event) ->
+      match e.change with
+      | (Bind d | Unbind d) when e.fn = gpu_bus ->
+          on_kernel_driver (Some d)
+          && List.exists (fun (_, d) -> d = Some vfio) e.others
+      | Bind d ->
+          d = vfio
+          && on_kernel_driver
+               (Option.join (List.assoc_opt gpu_bus e.others))
+      | Unbind _ -> false)
+    events
+
+let pp_event ppf (e : Tree.event) =
+  let change, d =
+    match e.change with Bind d -> ("bind", d) | Unbind d -> ("unbind", d)
+  in
+  let pp_other ppf (f, d) =
+    Format.fprintf ppf "%s on %s" f (Option.value d ~default:"no driver")
+  in
+  Format.fprintf ppf "%s %s %s, %a" change d e.fn
+    (Format.pp_print_list
+       ~pp_sep:(fun ppf () -> Format.pp_print_string ppf ", ")
+       pp_other)
+    e.others
+
+let event = Testable.make ~pp:pp_event ~equal:( = )
+
+(* [drivers root] is the drivers the tree [root] binds to the GPU and its
+   audio function. *)
+let drivers root = (Tree.driver root gpu_bus, Tree.driver root audio_bus)
+
+(* An attach that stopped part-way, or an administrator, may leave the audio
+   function on vfio-pci with the GPU unbound. Attach takes it off vfio-pci
+   before it probes the GPU's kernel driver, and gives it back to its own
+   after. *)
+let test_attach_siblings () =
+  needs_flock ();
+  let root =
+    Tree.make
+      [
+        Tree.gpu ~reset:(Some "flr") gpu_bus;
+        { (audio audio_bus) with driver = Some vfio };
+      ]
+  in
+  let k = Tree.kernel ~drivers:own_drivers root in
+  require_ok ~pp:Format.pp_print_string
+    (Driver.attach (gpus ()) (Tree.machine k) 0);
+  equal ~msg:"broken" (list event) [] (broken (Tree.events k));
+  equal ~msg:"drivers after"
+    (pair (option string) (option string))
+    (Some "amdgpu", Some "snd_hda_intel")
+    (drivers root)
+
+(* An attach that fails at the GPU's probe, its kernel driver not loaded,
+   leaves the audio function unbound, its override naming vfio-pci. Loading
+   the module binds the GPU, and the next attach gives the audio function
+   back. *)
+let test_attach_siblings_again () =
+  needs_flock ();
+  let root =
+    Tree.make
+      [
+        Tree.gpu ~reset:(Some "flr") gpu_bus;
+        { (audio audio_bus) with driver = Some vfio };
+      ]
+  in
+  let k = Tree.kernel ~unloaded:[ "amdgpu" ] ~drivers:own_drivers root in
+  let g = gpus () and m = Tree.machine k in
+  contains ~sub:"no kernel driver took 0000:03:00.0"
+    (require_error (Driver.attach g m 0));
+  equal ~msg:"drivers after the failure"
+    (pair (option string) (option string))
+    (None, None) (drivers root);
+  equal ~msg:"the audio function's override" string "vfio-pci"
+    (pci_file root (devices audio_bus "driver_override"));
+  Tree.load k "amdgpu";
+  require_ok ~pp:Format.pp_print_string (Driver.attach g m 0);
+  equal ~msg:"broken" (list event) [] (broken (Tree.events k));
+  equal ~msg:"drivers after"
+    (pair (option string) (option string))
+    (Some "amdgpu", Some "snd_hda_intel")
+    (drivers root)
+
+(* An attach that stopped part-way, or an administrator, may leave the audio
+   function on vfio-pci with the GPU bound to its kernel driver. Detach takes
+   it off vfio-pci before it unbinds the GPU's kernel driver, without an IOMMU
+   and behind one that translates. *)
+let bound_with_vfio =
+  [
+    ( "without an IOMMU",
+      [
+        Tree.gpu ~driver:"amdgpu" gpu_bus;
+        { (audio audio_bus) with driver = Some vfio };
+      ] );
+    ( "behind a translating IOMMU",
+      [
+        Tree.gpu ~driver:"amdgpu" ~group:"12" gpu_bus;
+        { (audio audio_bus) with driver = Some vfio; group = Some "12" };
+        vfio_elsewhere;
+      ] );
+  ]
+
+let test_detach_siblings (_, fns) =
+  needs_flock ();
+  let root = Tree.make fns in
+  let k = Tree.kernel ~drivers:own_drivers root in
+  equal progress Detached
+    (require_ok ~pp:Format.pp_print_string
+       (Driver.detach (gpus ()) (Tree.machine k) 0));
+  equal ~msg:"broken" (list event) [] (broken (Tree.events k))
+
+(* Changes that fail part-way keep the rule too. From each start, a state
+   that a change, one that stopped part-way or an administrator may leave,
+   attach, detach and attach again run with each of their writes refused in
+   turn, which leaves every state a failed write can. *)
+let starts =
+  [
+    ( "both on their own drivers without an IOMMU",
+      [ Tree.gpu ~driver:"amdgpu" gpu_bus; audio audio_bus ] );
+    ( "both on their own drivers behind a translating IOMMU",
+      [
+        Tree.gpu ~driver:"amdgpu" ~group:"12" gpu_bus;
+        { (audio audio_bus) with group = Some "12" };
+        vfio_elsewhere;
+      ] );
+    ( "the GPU unbound and the audio function on vfio-pci",
+      [
+        Tree.gpu ~reset:(Some "flr") gpu_bus;
+        { (audio audio_bus) with driver = Some vfio };
+      ] );
+  ]
+  @ List.map
+      (fun (n, fns) -> ("the audio function on vfio-pci " ^ n, fns))
+      bound_with_vfio
+
+(* The kernel of a tree of [fns] after attach, detach and attach, which
+   refuses the writes [refuse] names. *)
+let changed fns refuse =
+  let k = Tree.kernel ~refuse ~drivers:own_drivers (Tree.make fns) in
+  let g = gpus () and m = Tree.machine k in
+  ignore (Driver.attach g m 0 : (unit, string) result);
+  ignore (Driver.detach g m 0 : (Driver.progress, string) result);
+  ignore (Driver.attach g m 0 : (unit, string) result);
+  k
+
+let test_refused (_, fns) =
+  needs_flock ();
+  let n = Tree.writes (changed fns (Fun.const false)) in
+  for i = 0 to n - 1 do
+    equal
+      ~msg:(strf "write %d of %d refused" i n)
+      (list event) []
+      (broken (Tree.events (changed fns (( = ) i))))
+  done
+
 let tree_changes =
   group ~timeout:patience "changes on a machine's files"
     [
@@ -1548,6 +1722,22 @@ let tree_changes =
       test "a GPU the process holds is refused" test_change_held;
       test "detach keeps a device's other functions when the vendor says so"
         test_keep_siblings;
+      test
+        "attach takes the GPU's other functions off vfio-pci before it \
+         probes the GPU"
+        test_attach_siblings;
+      test
+        "an attach that fails at the GPU's probe leaves its other functions \
+         off vfio-pci for the attach after its module loads"
+        test_attach_siblings_again;
+      cases
+        "detach takes the GPU's other functions off vfio-pci before it \
+         unbinds the GPU"
+        ~name:fst bound_with_vfio test_detach_siblings;
+      cases
+        "attach and detach keep the GPU's other functions off vfio-pci \
+         while its kernel driver is bound, whichever write is refused"
+        ~name:fst starts test_refused;
       test
         "attach gives back a GPU that a detach behind a translating IOMMU left \
          part-way"
@@ -1734,6 +1924,19 @@ let test_stop_in_stop () =
     if reached then from (n + 1)
   in
   from 1
+
+(* Whether [a] is an allocation of a function's release. *)
+let in_release (a : Gc.Memprof.allocation) =
+  let release = "Rig_pci__Function.release" in
+  match Printexc.backtrace_slots a.callstack with
+  | Some slots ->
+      Array.exists
+        (fun s ->
+          match Printexc.Slot.name s with
+          | Some name -> String.starts_with ~prefix:release name
+          | None -> false)
+        slots
+  | None -> false
 
 type failure = Answers_error | Raises_exit
 
@@ -2013,14 +2216,17 @@ let exit_inside_lock root =
   ignore (Result.get_ok (Driver.open_ g m 1 start));
   ignore (Driver.open_ g m 2 (fun _ _ -> exit 0))
 
-(* The lines the suite's executable run with [mode] on the tree [root] printed
-   on standard output, and what it printed on standard error. *)
-let exiting ?(mode = exit_holding) root =
+(* The lines the suite's executable run with [mode] on the tree [root], and
+   [args] after it, printed on standard output, and what it printed on
+   standard error. *)
+let exiting ?(mode = exit_holding) ?(args = [||]) root =
   let exe = Sys.executable_name in
   let out_r, out_w = Unix.pipe ~cloexec:true () in
   let err_r, err_w = Unix.pipe ~cloexec:true () in
   let pid =
-    Unix.create_process exe [| exe; mode; root |] Unix.stdin out_w err_w
+    Unix.create_process exe
+      (Array.append [| exe; mode; root |] args)
+      Unix.stdin out_w err_w
   in
   Unix.close out_w;
   Unix.close err_w;
@@ -2061,6 +2267,109 @@ let test_exit_inside () =
   equal ~msg:"stops that raised at exit" (list string) []
     (List.filter at_exit (String.split_on_char '\n' err))
 
+(* Opens GPU 0 of the tree [root] and stops it with an exception at the
+   [n]-th allocation of the stop, or of its release where [where] is
+   ["release"]; stops it again, then opens it again and stops it. It prints
+   whether the [n]-th was reached, the calls of the vendor's stop, whether the
+   function is released and the second open's answer. *)
+let interrupted = "--interrupted-stop"
+
+let interrupted_stop root where n =
+  let g = gpus () and m = Machine.at root in
+  let stops = Atomic.make 0 in
+  let start h fn =
+    Driver.set_stop h (fun () ->
+        Atomic.incr stops;
+        `Clean);
+    Ok (h, fn)
+  in
+  let h, fn = Result.get_ok (Driver.open_ g m 0 start) in
+  let from = if where = "release" then Some in_release else None in
+  let reached = Rig_support.interrupted ?from n (fun () -> stop h) in
+  stop h;
+  let opened =
+    match Driver.open_ g m 0 (fun h _ -> kept h) with
+    | Ok h ->
+        stop h;
+        "opened"
+    | Error why -> why
+  in
+  List.iter print_endline
+    [
+      (if reached then "reached" else "unreached");
+      string_of_int (Atomic.get stops);
+      string_of_bool (Function.released fn);
+      opened;
+    ];
+  exit 0
+
+(* What [interrupted_stop] printed on a new tree, as whether the [n]-th
+   allocation was reached, the vendor's stops, whether the function was
+   released and the second open's answer, once the tree's GPU opened again
+   after the process exited. *)
+let interrupting where n =
+  needs_flock ();
+  let root = Tree.make [ Tree.gpu gpu_bus ] in
+  let at what = strf "%s, interrupted at %d" what n in
+  let out, err =
+    exiting ~mode:interrupted ~args:[| where; string_of_int n |] root
+  in
+  (match Driver.open_ (gpus ()) (Machine.at root) 0 (fun h _ -> kept h) with
+  | Ok h -> stop h
+  | Error why -> failf "%s: %s" (at "the open after the exit") why);
+  match out with
+  | [ reached; stops; released; opened ] ->
+      ( reached = "reached",
+        int_of_string stops,
+        bool_of_string released,
+        opened )
+  | _ ->
+      failf "%s: %S %S" (at "the process printed") (String.concat "|" out) err
+
+let until_exit = "is held by this process until it exits"
+
+(* A stop whose release an exception ends at any allocation leaves the GPU
+   held until the process exits: the next stop returns, the vendor's stop
+   called once, and an open is refused, saying so. Once the process exits,
+   the GPU opens. *)
+let test_interrupted_release () =
+  let rec from n =
+    let reached, stops, released, opened = interrupting "release" n in
+    let at what = strf "%s, interrupted at %d" what n in
+    equal ~msg:(at "the vendor's stops") int 1 stops;
+    equal ~msg:(at "the function released") bool true released;
+    if n = 1 then equal ~msg:"the release allocates" bool true reached;
+    if reached then begin
+      contains ~msg:(at "the open after") ~sub:until_exit opened;
+      from (n + 1)
+    end
+    else equal ~msg:(at "the open after") string "opened" opened
+  in
+  from 1
+
+(* A stop that an exception ends at any allocation is ended by the next stop,
+   the vendor's stop called at most once. The GPU opens again, or, where the
+   exception came once the release began, the process holds it until it
+   exits, and an open says so. Both happen. *)
+let test_interrupted_stop () =
+  let rec from n (opens, holds) =
+    let reached, stops, released, opened = interrupting "stop" n in
+    let at what = strf "%s, interrupted at %d" what n in
+    less ~msg:(at "the vendor's stops") int ~than:2 stops;
+    let counts =
+      if opened = "opened" then (opens + 1, holds)
+      else begin
+        contains ~msg:(at "the open after") ~sub:until_exit opened;
+        equal ~msg:(at "the function released") bool true released;
+        (opens, holds + 1)
+      end
+    in
+    if reached then from (n + 1) counts else counts
+  in
+  let opens, holds = from 1 (0, 0) in
+  greater ~msg:"stops after which the GPU opened" int ~than:0 opens;
+  greater ~msg:"stops after which the process held the GPU" int ~than:0 holds
+
 let exits =
   group ~timeout:patience "exit"
     [
@@ -2073,12 +2382,22 @@ let exits =
         "a process that exits inside a lock that no stop takes stops every \
          GPU"
         test_exit_inside;
+      test
+        "a stop whose release an exception ends at any allocation leaves its \
+         GPU held until the process exits"
+        test_interrupted_release;
+      test
+        "a stop an exception ends at any allocation is ended by the next \
+         stop, the vendor's stop called at most once"
+        test_interrupted_stop;
     ]
 
 let () =
   match Sys.argv with
   | [| _; arg; root |] when arg = exit_holding -> exit_holding_gpus root
   | [| _; arg; root |] when arg = exit_inside -> exit_inside_lock root
+  | [| _; arg; root; where; n |] when arg = interrupted ->
+      interrupted_stop root where (int_of_string n)
   | _ ->
       exit
       @@ run "rig_pci.driver"
